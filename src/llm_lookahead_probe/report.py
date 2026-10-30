@@ -1,0 +1,220 @@
+"""report.json / report.md construction and safe writing."""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import date
+from pathlib import Path
+
+from . import __version__
+
+
+def build_report(
+    summary: dict,
+    *,
+    mode: str,
+    model: str,
+    config: dict,
+    cutoff: date,
+    cutoff_source: str,
+    masked_prompts_checked: int,
+    usage: dict | None = None,
+) -> dict:
+    rep = {
+        "tool": "llm-lookahead-probe",
+        "version": __version__,
+        "mode": mode,
+        "model": model,
+        "cutoff": cutoff.isoformat(),
+        "cutoff_source": cutoff_source,
+        "config": config,
+        "leak_check": {"masked_prompts_checked": masked_prompts_checked, "leaks_found": 0},
+    }
+    rep.update(summary)
+    if usage is not None:
+        rep["usage"] = usage
+    return rep
+
+
+# Stated in every report so a reader of one file sees them. docs/DESIGN.md has the longer version.
+LIMITS = (
+    "pre - post removes only a masking effect that is constant in pnl. Abstaining more when masked "
+    "scales with each period's mean |r|; compare the 'gap / mean abs r' column of the two periods.",
+    "A change in trade direction under masking (e.g. more LONG on real tickers than on ASSET_nn) "
+    "scales with each period's mean r (drift), not mean |r|. An up-drifting pre-cutoff period then "
+    "gives pre - post > 0 with no memory. The verdict also requires the drift-adjusted gap to pass, "
+    "and the report warns when the direction shift explains a material share of pre - post.",
+    "Masking keeps the exact return path and, under a whole-week date shift, the holiday-gap "
+    "pattern. A model could recognise an episode from either, which biases toward under-detection.",
+    "Masked dates fall in the real past (shifted back), not in a fictional calendar.",
+    "The panel must be rectangular (every ticker on every date), i.e. a survivor-only universe.",
+    "Decisions are made and scored at the observed close of the decision date.",
+    "The leak check covers only the renderer's canonical forms (whole-token ticker, YYYY-MM-DD, "
+    "d.dd); tests pin the prompt to that grammar.",
+    "Offline mock results (e.g. power 1.0 for the memorising mock) say nothing about real models.",
+)
+
+
+def _f(x, pct=False) -> str:
+    if x is None:
+        return "n/a"
+    return f"{x * 100:.3f}%" if pct else f"{x:.4f}"
+
+
+def _pp(x: float) -> str:
+    return f"{x * 100:+.1f} pp"
+
+
+def _ci(c: dict | None) -> str:
+    if not c:
+        return "n/a"
+    return f"{_f(c['estimate'], True)} [{_f(c['low'], True)}, {_f(c['high'], True)}]"
+
+
+def render_markdown(rep: dict) -> str:
+    lvl = int(round(rep["interval"]["level"] * 100))
+    lines = [
+        "# llm-lookahead-probe report",
+        "",
+        f"- Mode: {rep['mode']}; model: `{rep['model']}`",
+        f"- Training cutoff used for the split: {rep['cutoff']} ({rep['cutoff_source']})",
+        f"- Episodes: {rep['n_episodes']} over {rep['n_dates']} decision dates",
+        f"- Leak check: {rep['leak_check']['masked_prompts_checked']} masked prompts checked, "
+        f"{rep['leak_check']['leaks_found']} leaks",
+        "",
+        f"## Verdict: **{rep['verdict']}**",
+        "",
+        rep["verdict_reason"],
+        "",
+        f"Rule: {rep['verdict_rule']}",
+        "",
+        f"## Gap (unmasked minus masked mean pnl per episode, {lvl}% CI)",
+        "",
+        "| Part | Dates | Episodes | Gap [CI] | Mean abs r | Gap / mean abs r |",
+        "|---|---|---|---|---|---|",
+        f"| All | {rep['n_dates']} | {rep['n_episodes']} | {_ci(rep['gap'])} "
+        f"| {_f(rep.get('mean_abs_r'), True)} | {_f(rep.get('gap_per_mean_abs_r'))} |",
+        f"| Before cutoff | {rep['pre']['n_dates']} | {rep['pre']['n_episodes']} "
+        f"| {_ci(rep['pre']['gap'])} | {_f(rep['pre'].get('mean_abs_r'), True)} "
+        f"| {_f(rep['pre'].get('gap_per_mean_abs_r'))} |",
+        f"| On/after cutoff | {rep['post']['n_dates']} | {rep['post']['n_episodes']} "
+        f"| {_ci(rep['post']['gap'])} | {_f(rep['post'].get('mean_abs_r'), True)} "
+        f"| {_f(rep['post'].get('gap_per_mean_abs_r'))} |",
+        f"| Pre minus post | | | {_ci(rep['diff_pre_minus_post'])} | | |",
+        "",
+        "## Arms",
+        "",
+        "| Arm | Mean pnl | Hit rate | Long | Short | Abstain | Long rate | Short rate | Abstain rate "
+        "| Unparseable |",
+        "|---|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name in ("unmasked", "masked"):
+        a = rep["arms"][name]
+        lines.append(
+            f"| {name} | {_f(a['mean_pnl'], True)} | {_f(a['hit_rate'])} | {a['n_long']} | "
+            f"{a['n_short']} | {a['n_abstain']} | {_f(a['long_rate'], True)} | "
+            f"{_f(a['short_rate'], True)} | {_f(a['abstain_rate'], True)} | {a['n_unparseable']} |"
+        )
+    sh = rep.get("abstain_shift")
+    if sh:
+        lines += [
+            "",
+            f"Abstain rate, masked minus unmasked: whole run {_pp(sh['masked_minus_unmasked'])}, "
+            + ", ".join(f"{k} {_pp(v)}" for k, v in sh["by_part"].items() if k != "whole-run")
+            + f" (flagged above {sh['threshold']:.0%}).",
+        ]
+        if sh["flag"]:
+            lines += ["", f"**Warning: abstain rate changes under masking.** {sh['note']}."]
+    ds = rep.get("direction_shift")
+    adj = rep.get("drift_adjusted")
+    if ds and adj:
+        lines += [
+            "",
+            "## Trade direction and drift",
+            "",
+            "Net long rate = long rate - short rate. A model whose action does not depend on r earns "
+            "net long x mean r, so a direction change under masking explains "
+            "(net long unmasked - net long masked) x mean r of the gap. The drift-adjusted gap "
+            f"scores pnl on r minus the part's mean r, which removes that term ({lvl}% CI).",
+            "",
+            "| Part | Mean r | Net long unmasked | Net long masked | Masked - unmasked "
+            "| Gap explained by direction bias | Drift-adjusted gap [CI] |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        arms_by = {"whole-run": rep["arms"]} | {k: rep[k].get("arms") for k in ("pre", "post")}
+        mean_r = {"whole-run": rep.get("mean_r")} | {k: rep[k].get("mean_r") for k in ("pre", "post")}
+        adj_by = {"whole-run": adj["gap"], "pre": adj.get("pre"), "post": adj.get("post")}
+        for key, label in (("whole-run", "All"), ("pre", "Before cutoff"), ("post", "On/after cutoff")):
+            arms = arms_by[key]
+            if not arms:
+                continue
+            lines.append(
+                f"| {label} | {_f(mean_r[key], True)} | {_f(arms['unmasked']['net_long_rate'])} "
+                f"| {_f(arms['masked']['net_long_rate'])} | {_pp(ds['by_part'][key])} "
+                f"| {_f(ds['gap_explained_by_direction_bias'][key], True)} | {_ci(adj_by[key])} |"
+            )
+        lines.append(
+            f"| Pre minus post | | | | | {_f(ds['explained_pre_minus_post'], True)} "
+            f"| {_ci(adj.get('diff_pre_minus_post'))} |"
+        )
+        if ds["flag"]:
+            lines += ["", f"**Warning: trade direction changes under masking.** {ds['note']}."]
+    lines += [
+        "",
+        f"Interval: {rep['interval']['method']}. Each decision date is one observation because "
+        "episodes on one date share the market move.",
+        f"Unparseable answers count as ABSTAIN (pnl 0); above {rep['interval']['max_unparseable_rate']:.0%} "
+        "in either arm the run is invalid. Above "
+        f"{rep['interval']['max_abstain_rate']:.0%} ABSTAIN (including unparseable) in either arm "
+        "the run is invalid too: too few trades.",
+    ]
+    b = rep.get("robustness", {}).get("cluster_bootstrap")
+    if b:
+        lines += [
+            "",
+            f"## Robustness: {b['method']}",
+            "",
+            f"{b['n_resamples']} resamples, seed {b['seed']}. Known to under-cover at 30-60 dates.",
+            "",
+            "| Part | Bootstrap CI |",
+            "|---|---|",
+        ]
+        for label, key in (
+            ("All", "gap"),
+            ("Before cutoff", "pre"),
+            ("On/after cutoff", "post"),
+            ("Pre minus post", "diff_pre_minus_post"),
+        ):
+            c = b[key]
+            cell = "n/a" if not c else f"[{_f(c['low'], True)}, {_f(c['high'], True)}]"
+            lines.append(f"| {label} | {cell} |")
+    lines += ["", "## Limits of this probe", ""] + [f"- {x}" for x in LIMITS]
+    if "usage" in rep:
+        u = rep["usage"]
+        lines += [
+            "",
+            "## API usage (from API responses)",
+            "",
+            f"- Calls made: {u['api_calls']}; served from cache: {u['cache_hits']}",
+            f"- Input tokens: {u['input_tokens']}; output tokens: {u['output_tokens']}",
+            f"- Cost of calls made in this run: ${u['cost_usd']:.6f}",
+            f"- Stop reasons: {u['stop_reasons']}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def write_reports(rep: dict, out_dir: str | os.PathLike[str]) -> tuple[Path, Path]:
+    """Write report.json and report.md. Refuses symlinked targets so a planted link cannot
+    redirect the write to another file."""
+    out = Path(out_dir)
+    if out.is_symlink():
+        raise ValueError(f"refusing to write into symlinked directory {out}")
+    out.mkdir(parents=True, exist_ok=True)
+    paths = (out / "report.json", out / "report.md")
+    for p in paths:
+        if p.is_symlink():
+            raise ValueError(f"refusing to overwrite symlink {p}")
+    paths[0].write_text(json.dumps(rep, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    paths[1].write_text(render_markdown(rep), encoding="utf-8")
+    return paths

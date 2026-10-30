@@ -1,0 +1,47 @@
+# env pin, 2026-10-30T03:55:52Z
+repo: . (repository root) branch feat/v0.1-probe HEAD 664301b3d48b8e89883b324dfeff7bab2f0426b6
+git status --short:
+?? docs/validation/
+interpreter: .venv/bin/python
+Python 3.12.13
+3.12.13 (main, Jun 23 2026, 15:19:07) [Clang 22.1.3 ]
+Linux-7.0.0-1019-nvidia-aarch64-with-glibc2.39
+--- pip freeze (uv pip freeze)
+annotated-types==0.8.0
+anthropic==2.3.0
+anyio==4.15.1
+docstring-parser==0.18.0
+h11==0.16.0
+httpcore2==2.16.0
+httpx2==2.16.0
+idna==3.20
+iniconfig==2.3.1
+jiter==0.18.0
+-e . (this repository, editable; absolute path removed)
+numpy==2.5.4
+opentelemetry-api==1.45.2
+packaging==26.3
+pluggy==1.7.0
+pydantic==2.14.2
+pydantic-core==2.50.2
+pygments==2.21.0
+pytest==9.2.0
+ruff==0.17.3
+sniffio==1.3.1
+truststore==0.10.5
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+--- sha256 of files under audit
+78f9c47b0746125055d7dbd961595e46cb562ab35de74e5cba00aec823655b1c  src/llm_lookahead_probe/agent.py
+3a7de5ed557fc42ab271a1e455aecffe11ef44af4306ca0582267f6d6c1d4709  src/llm_lookahead_probe/cli.py
+447fca68667ea50c5bd0d312dd7edfe41824c608bb440fd904016149e74c08c4  src/llm_lookahead_probe/data.py
+442350b8e9b3b746509cb28319acd40e861753e7579a56aa12f5ac8053a9ce0c  src/llm_lookahead_probe/__init__.py
+5fbbd3cd9e220dc78d7a822386ea7cea03d07555605e109451b0b0c8f10b9a9b  src/llm_lookahead_probe/live.py
+cfadcce90b8593398019abe976d997eef6c46e1e066eb4d144228aba1dd4ecd1  src/llm_lookahead_probe/masking.py
+5b7c39323c320854780ad9e53d40bb88f2a81b399be69f4454a9021b5d63e113  src/llm_lookahead_probe/mocks.py
+9e9d7dfbc4b3ab32c9fae63c0382f647d218e79602ec685551442fdadaaef9f7  src/llm_lookahead_probe/pit.py
+1712ff0361a7dc06e276d089b1e75b3e3da424e305a5c96d4cec851413b86c2b  src/llm_lookahead_probe/probe.py
+a7b0552bc8cfa3e3ee873df337bce07568e0bbdf6c295a2479ed08501f83707e  src/llm_lookahead_probe/prompt.py
+0d82fcbdcebfb43e45909bf2bbe4d2101dcc62fba2aed551694121bd8918e388  src/llm_lookahead_probe/report.py
+286591fa463f3cfe7f2eb76daf70fd6938e6b534f5d2625e2c098fe853d40059  src/llm_lookahead_probe/stats.py
+136645014af23a19c5de14ff56f632fd2356364b663cdad4951ffe7e3e2bfb0e  docs/DESIGN.md
