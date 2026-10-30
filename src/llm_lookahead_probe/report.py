@@ -39,9 +39,12 @@ def build_report(
 
 # Stated in every report so a reader of one file sees them. docs/DESIGN.md has the longer version.
 LIMITS = (
-    "pre - post removes only a masking effect that is constant in pnl. An effect constant in "
-    "behaviour (e.g. abstaining more when masked) scales with each period's mean |r|; compare the "
-    "'gap / mean abs r' column of the two periods before reading pre - post as memory.",
+    "pre - post removes only a masking effect that is constant in pnl. Abstaining more when masked "
+    "scales with each period's mean |r|; compare the 'gap / mean abs r' column of the two periods.",
+    "A change in trade direction under masking (e.g. more LONG on real tickers than on ASSET_nn) "
+    "scales with each period's mean r (drift), not mean |r|. An up-drifting pre-cutoff period then "
+    "gives pre - post > 0 with no memory. The verdict also requires the drift-adjusted gap to pass, "
+    "and the report warns when the direction shift explains a material share of pre - post.",
     "Masking keeps the exact return path and, under a whole-week date shift, the holiday-gap "
     "pattern. A model could recognise an episode from either, which biases toward under-detection.",
     "Masked dates fall in the real past (shifted back), not in a fictional calendar.",
@@ -102,14 +105,16 @@ def render_markdown(rep: dict) -> str:
         "",
         "## Arms",
         "",
-        "| Arm | Mean pnl | Hit rate | Long | Short | Abstain | Abstain rate | Unparseable |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Arm | Mean pnl | Hit rate | Long | Short | Abstain | Long rate | Short rate | Abstain rate "
+        "| Unparseable |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name in ("unmasked", "masked"):
         a = rep["arms"][name]
         lines.append(
             f"| {name} | {_f(a['mean_pnl'], True)} | {_f(a['hit_rate'])} | {a['n_long']} | "
-            f"{a['n_short']} | {a['n_abstain']} | {_f(a['abstain_rate'], True)} | {a['n_unparseable']} |"
+            f"{a['n_short']} | {a['n_abstain']} | {_f(a['long_rate'], True)} | "
+            f"{_f(a['short_rate'], True)} | {_f(a['abstain_rate'], True)} | {a['n_unparseable']} |"
         )
     sh = rep.get("abstain_shift")
     if sh:
@@ -121,6 +126,40 @@ def render_markdown(rep: dict) -> str:
         ]
         if sh["flag"]:
             lines += ["", f"**Warning: abstain rate changes under masking.** {sh['note']}."]
+    ds = rep.get("direction_shift")
+    adj = rep.get("drift_adjusted")
+    if ds and adj:
+        lines += [
+            "",
+            "## Trade direction and drift",
+            "",
+            "Net long rate = long rate - short rate. A model whose action does not depend on r earns "
+            "net long x mean r, so a direction change under masking explains "
+            "(net long unmasked - net long masked) x mean r of the gap. The drift-adjusted gap "
+            f"scores pnl on r minus the part's mean r, which removes that term ({lvl}% CI).",
+            "",
+            "| Part | Mean r | Net long unmasked | Net long masked | Masked - unmasked "
+            "| Gap explained by direction bias | Drift-adjusted gap [CI] |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        arms_by = {"whole-run": rep["arms"]} | {k: rep[k].get("arms") for k in ("pre", "post")}
+        mean_r = {"whole-run": rep.get("mean_r")} | {k: rep[k].get("mean_r") for k in ("pre", "post")}
+        adj_by = {"whole-run": adj["gap"], "pre": adj.get("pre"), "post": adj.get("post")}
+        for key, label in (("whole-run", "All"), ("pre", "Before cutoff"), ("post", "On/after cutoff")):
+            arms = arms_by[key]
+            if not arms:
+                continue
+            lines.append(
+                f"| {label} | {_f(mean_r[key], True)} | {_f(arms['unmasked']['net_long_rate'])} "
+                f"| {_f(arms['masked']['net_long_rate'])} | {_pp(ds['by_part'][key])} "
+                f"| {_f(ds['gap_explained_by_direction_bias'][key], True)} | {_ci(adj_by[key])} |"
+            )
+        lines.append(
+            f"| Pre minus post | | | | | {_f(ds['explained_pre_minus_post'], True)} "
+            f"| {_ci(adj.get('diff_pre_minus_post'))} |"
+        )
+        if ds["flag"]:
+            lines += ["", f"**Warning: trade direction changes under masking.** {ds['note']}."]
     lines += [
         "",
         f"Interval: {rep['interval']['method']}. Each decision date is one observation because "

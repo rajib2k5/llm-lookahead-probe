@@ -49,6 +49,29 @@ MAX_ABSTAIN_RATE = 0.50
 # gap on its own (tests/test_stats.py shows a pre-only masked abstain giving a false "suspected").
 ABSTAIN_SHIFT_FLAG = 0.10
 
+# Direction bias under masking. A model whose action does not depend on r, given the arm, earns
+# E[pnl] = net_long x E[r] (pnl = +r LONG, -r SHORT, 0 ABSTAIN; net_long = long rate - short rate).
+# So if masking moves the net long rate (e.g. bullish on familiar real tickers, neutral or bearish
+# on ASSET_nn), the gap picks up (net_long_u - net_long_m) x mean r with no memory at all. This
+# scales with the period's mean r (drift), not mean |r|, and a survivor-only panel has an upward
+# pre-cutoff drift, so it gives gap_pre - gap_post > 0. Two defences, measured in
+# tests/test_direction_bias.py:
+#  1. The verdict also requires the drift-adjusted gap (pnl scored on r - mean r of the part) to
+#     pass both tests. For an r-independent action this removes the bias x drift term exactly
+#     (mean pnl(a, r - mu) = mean pnl(a, r) - net_long x mu). It does not remove memory: a model
+#     that knows the sign of r still earns E[s (r - mu)] > 0. It removes only the part of real
+#     memory that shows up as "more LONG in an up-drifting period", net_long_shift x mu.
+#  2. A warning when |masked - unmasked net long rate| exceeds DIRECTION_SHIFT_FLAG in any part
+#     AND the observed pre - post is > 0 AND the bias x drift component of pre - post is at least
+#     DIRECTION_BIAS_SHARE of it (same sign). It is a warning, not a gate: real memory also changes
+#     direction in a drifting period, so gating on the shift would kill power. An earlier draft
+#     used |explained| >= 25% of |observed| in either sign; on the honest mock (8 tickers x 60
+#     dates) that warned in 15.2% of 500 seeds, mostly on noise pushing pre - post below 0.
+# 10 pp matches the abstain flag. 25%: below a quarter, bias x drift cannot turn a clear pre - post
+# into a doubtful one; above it the reader should look at the drift-adjusted numbers.
+DIRECTION_SHIFT_FLAG = 0.10
+DIRECTION_BIAS_SHARE = 0.25
+
 VERDICT_RULE = (
     "'invalid run' if, in the whole run or in the pre-cutoff or post-cutoff part, either arm has "
     f"more than {MAX_UNPARSEABLE_RATE:.0%} unparseable answers (refusals, empty or truncated "
@@ -57,7 +80,9 @@ VERDICT_RULE = (
     "trades: a model that abstains has gap 0 by construction); else "
     "'insufficient data' if the pre-cutoff or post-cutoff part has fewer than "
     f"{MIN_DATES_PER_PART} decision dates; else 'memorisation suspected' if the lower CI bound "
-    "of gap_pre > 0 AND the lower CI bound of (gap_pre - gap_post) > 0; otherwise 'no evidence'. "
+    "of gap_pre > 0 AND the lower CI bound of (gap_pre - gap_post) > 0, for BOTH the raw gap and the "
+    "drift-adjusted gap (pnl scored on r minus the mean r of that part, which removes a masking "
+    "direction bias x drift); otherwise 'no evidence'. "
     "gap = mean over episodes of (pnl_unmasked - pnl_masked). CIs are Student t intervals on the "
     "per-date mean differences with G - 1 df (G = decision dates); the pre - post CI is Welch's "
     "interval with Welch-Satterthwaite df. Every date must have the same number of episodes."
@@ -260,11 +285,17 @@ def _arm_metrics(actions: list[Action], parsed: list[bool], r: np.ndarray) -> di
     hits = sum((a == Action.LONG and x > 0) or (a == Action.SHORT and x < 0) for a, x in trades)
     n_unparseable = sum(not ok for ok in parsed)
     n_abstain = sum(a == Action.ABSTAIN for a in actions)
+    n_long = sum(a == Action.LONG for a in actions)
+    n_short = sum(a == Action.SHORT for a in actions)
+    n = len(actions)
     return {
         "mean_pnl": float(p.mean()) if len(p) else None,
         "hit_rate": hits / len(trades) if trades else None,
-        "n_long": sum(a == Action.LONG for a in actions),
-        "n_short": sum(a == Action.SHORT for a in actions),
+        "n_long": n_long,
+        "n_short": n_short,
+        "long_rate": n_long / n if n else None,
+        "short_rate": n_short / n if n else None,
+        "net_long_rate": (n_long - n_short) / n if n else None,
         "n_abstain": n_abstain,
         "abstain_rate": n_abstain / len(actions) if actions else None,
         "n_unparseable": n_unparseable,
@@ -280,8 +311,10 @@ def _arms(recs: list[EpisodeResult]) -> dict:
     }
 
 
-def _diffs(recs: list[EpisodeResult]) -> tuple[np.ndarray, np.ndarray]:
-    d = np.array([pnl(e.action_u, e.r) - pnl(e.action_m, e.r) for e in recs])
+def _diffs(recs: list[EpisodeResult], mu: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    """Per-episode paired pnl differences, scored on r - mu (mu = 0: raw; mu = mean r of the part:
+    drift-adjusted), with the date ordinal of each episode as its cluster."""
+    d = np.array([pnl(e.action_u, e.r - mu) - pnl(e.action_m, e.r - mu) for e in recs])
     c = np.array([e.date.toordinal() for e in recs])
     return d, c
 
@@ -341,16 +374,75 @@ def _abstain_shift(arms_by_part: dict[str, dict]) -> dict:
 
 
 def _scaled(gap: float, recs: list[EpisodeResult]) -> dict:
-    """gap / mean|r| for one period. pre - post cancels a masking effect that is constant in pnl,
-    but an effect that is constant in *behaviour* (e.g. abstaining more often when masked) costs
-    pnl in proportion to |r|, so it differs between a calm and a volatile period. Comparing the
-    scaled gaps of pre and post shows whether a pre - post difference could be such an effect."""
+    """gap / mean|r| and mean r for one period. An abstain-type behaviour change under masking
+    costs pnl in proportion to |r|, so it differs between a calm and a volatile period; the scaled
+    gap shows that. A direction-type change (net long rate moves under masking) costs pnl in
+    proportion to mean r instead, which gap / mean|r| does NOT show; see DIRECTION_SHIFT_FLAG and
+    the drift-adjusted gap for that."""
     mar = float(np.mean([abs(e.r) for e in recs]))
-    return {"mean_abs_r": mar, "gap_per_mean_abs_r": gap / mar if mar > 0 else None}
+    return {
+        "mean_r": float(np.mean([e.r for e in recs])),
+        "mean_abs_r": mar,
+        "gap_per_mean_abs_r": gap / mar if mar > 0 else None,
+    }
+
+
+def _direction_shift(
+    arms_by_part: dict[str, dict], mean_r: dict[str, float], observed_diff: float | None
+) -> dict:
+    """masked - unmasked net long rate per part, and the gap a pure direction bias explains:
+    (net_long_u - net_long_m) x mean r. Flagged per DIRECTION_SHIFT_FLAG / DIRECTION_BIAS_SHARE."""
+    by_part = {
+        part: arms["masked"]["net_long_rate"] - arms["unmasked"]["net_long_rate"]
+        for part, arms in arms_by_part.items()
+    }
+    explained = {part: -by_part[part] * mean_r[part] for part in by_part}
+    worst = max(by_part, key=lambda k: abs(by_part[k]))
+    explained_diff = None
+    share = None
+    material = False
+    if observed_diff is not None and "pre" in explained and "post" in explained:
+        explained_diff = explained["pre"] - explained["post"]
+        if observed_diff != 0:
+            share = explained_diff / observed_diff
+        # Only the direction that can fake memory: pre - post > 0 with the bias pushing it up. A
+        # bias component against the observed sign makes the test conservative, not misleading.
+        material = observed_diff > 0 and explained_diff >= DIRECTION_BIAS_SHARE * observed_diff
+    flag = abs(by_part[worst]) > DIRECTION_SHIFT_FLAG and material
+    return {
+        "masked_minus_unmasked_net_long": by_part["whole-run"],
+        "by_part": by_part,
+        "gap_explained_by_direction_bias": explained,
+        "explained_pre_minus_post": explained_diff,
+        "observed_pre_minus_post": observed_diff,
+        "explained_share_of_pre_minus_post": share,
+        "threshold": DIRECTION_SHIFT_FLAG,
+        "share_threshold": DIRECTION_BIAS_SHARE,
+        "flag": flag,
+        "note": (
+            f"net long rate (long - short), masked minus unmasked, moves by {by_part[worst]:+.1%} "
+            f"in the {worst} episodes; times each part's mean r this explains "
+            f"{_fmt(explained_diff)} of the observed pre - post {_fmt(observed_diff)}. A model "
+            "that is more bullish on real tickers than on pseudonyms gains in an up-drifting "
+            "period without any memory; read the drift-adjusted gap"
+        ),
+    }
 
 
 def _fmt(x: float | None) -> str:
     return "n/a" if x is None else f"{x:.6f}"
+
+
+def _passes(pre_gap: dict | None, diff: CI | None) -> bool:
+    """Both lower CI bounds (gap_pre and gap_pre - gap_post) exist and are > 0."""
+    return (
+        pre_gap is not None
+        and pre_gap["low"] is not None
+        and pre_gap["low"] > 0
+        and diff is not None
+        and diff.low is not None
+        and diff.low > 0
+    )
 
 
 def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, level: float, seed: int) -> dict:
@@ -367,6 +459,8 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
 
     parts: dict[str, dict] = {}
     part_means: dict[str, np.ndarray] = {}
+    adj_means: dict[str, np.ndarray] = {}
+    adjusted: dict = {}
     part_recs = {
         "pre": [e for e in records if e.date < cutoff],
         "post": [e for e in records if e.date >= cutoff],
@@ -379,17 +473,37 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
             part["gap"] = t_interval(part_means[name], level).as_dict(level)
             part.update(_scaled(part["gap"]["estimate"], recs))
             part["arms"] = _arms(recs)
+            da, ca = _diffs(recs, part["mean_r"])
+            adj_means[name] = _date_means(da, ca)
+            adjusted[name] = t_interval(adj_means[name], level).as_dict(level)
         else:
             part["gap"] = None
+            adjusted[name] = None
         parts[name] = part
 
-    diff = None
+    diff = adj_diff = None
     if "pre" in part_means and "post" in part_means:
         diff = welch_interval(part_means["pre"], part_means["post"], level)
+        adj_diff = welch_interval(adj_means["pre"], adj_means["post"], level)
+    mean_r_all = float(np.mean([e.r for e in records]))
+    da, ca = _diffs(records, mean_r_all)
+    adjusted = {
+        "method": (
+            "pnl scored on r minus the mean r of the part (whole run, pre or post); same intervals "
+            "as the raw gap. Equals raw gap minus (net_long_u - net_long_m) x mean r."
+        ),
+        "gap": t_interval(_date_means(da, ca), level).as_dict(level),
+        **adjusted,
+        "diff_pre_minus_post": adj_diff.as_dict(level) if adj_diff else None,
+    }
 
     arms_all = _arms(records)
     arms_by_part = {"whole-run": arms_all} | {n: p["arms"] for n, p in parts.items() if "arms" in p}
     invalid = _invalid_reason(arms_by_part)
+    mean_r_by_part = {"whole-run": mean_r_all} | {n: p["mean_r"] for n, p in parts.items() if "mean_r" in p}
+    direction = _direction_shift(arms_by_part, mean_r_by_part, diff.estimate if diff else None)
+    raw_pass = _passes(parts["pre"]["gap"], diff)
+    adj_pass = _passes(adjusted["pre"], adj_diff)
     if invalid:
         verdict, reason = "invalid run", invalid
     elif parts["pre"]["n_dates"] < MIN_DATES_PER_PART or parts["post"]["n_dates"] < MIN_DATES_PER_PART:
@@ -398,24 +512,29 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
             f"insufficient data: pre has {parts['pre']['n_dates']} and post has "
             f"{parts['post']['n_dates']} decision dates; each needs at least {MIN_DATES_PER_PART}"
         )
-    elif (
-        parts["pre"]["gap"]["low"] is not None
-        and parts["pre"]["gap"]["low"] > 0
-        and diff is not None
-        and diff.low is not None
-        and diff.low > 0
-    ):
-        verdict = "memorisation suspected"
-        reason = (
-            f"gap_pre CI low {parts['pre']['gap']['low']:.6f} > 0 and "
-            f"(gap_pre - gap_post) CI low {diff.low:.6f} > 0"
-        )
     else:
-        verdict = "no evidence"
-        reason = (
-            f"gap_pre CI low {_fmt(parts['pre']['gap']['low'])}, "
-            f"(gap_pre - gap_post) CI low {_fmt(diff.low if diff else None)}: both must be > 0"
+        raw_txt = (
+            f"raw: gap_pre CI low {_fmt(parts['pre']['gap']['low'])}, "
+            f"(gap_pre - gap_post) CI low {_fmt(diff.low if diff else None)}"
         )
+        adj_txt = (
+            f"drift-adjusted: gap_pre CI low {_fmt(adjusted['pre']['low'] if adjusted['pre'] else None)}, "
+            f"(gap_pre - gap_post) CI low {_fmt(adj_diff.low if adj_diff else None)}"
+        )
+        if raw_pass and adj_pass:
+            verdict = "memorisation suspected"
+            reason = f"{raw_txt}; {adj_txt}; all four > 0"
+        elif raw_pass:
+            verdict = "no evidence"
+            reason = (
+                f"{raw_txt} (both > 0), but {adj_txt}: not both > 0. The raw gap can be explained "
+                "by a change in trade direction under masking times the drift of the period"
+            )
+        else:
+            verdict = "no evidence"
+            reason = f"{raw_txt}; {adj_txt}: all four must be > 0"
+        if direction["flag"]:
+            reason += f". Warning: trade direction changes under masking: {direction['note']}"
 
     return {
         "n_episodes": len(records),
@@ -427,6 +546,8 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
         "post": parts["post"],
         "diff_pre_minus_post": diff.as_dict(level) if diff else None,
         "abstain_shift": _abstain_shift(arms_by_part),
+        "direction_shift": direction,
+        "drift_adjusted": adjusted,
         "verdict": verdict,
         "verdict_reason": reason,
         "verdict_rule": VERDICT_RULE,
@@ -437,6 +558,8 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
             "max_unparseable_rate": MAX_UNPARSEABLE_RATE,
             "max_abstain_rate": MAX_ABSTAIN_RATE,
             "abstain_shift_flag": ABSTAIN_SHIFT_FLAG,
+            "direction_shift_flag": DIRECTION_SHIFT_FLAG,
+            "direction_bias_share": DIRECTION_BIAS_SHARE,
         },
         "robustness": {"cluster_bootstrap": _bootstrap_block(records, part_recs, n_resamples, level, seed)},
     }

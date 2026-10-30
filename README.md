@@ -32,28 +32,32 @@ Output of the first command (headline lines):
 
 ```text
 Verdict: memorisation suspected
-  gap_pre CI low 0.009371 > 0 and (gap_pre - gap_post) CI low 0.008162 > 0
+  raw: gap_pre CI low 0.009371, (gap_pre - gap_post) CI low 0.008162; drift-adjusted: gap_pre CI low 0.009311, (gap_pre - gap_post) CI low 0.008102; all four > 0
 Episodes: 2400 on 120 dates; cutoff 2025-01-02
 Gap (unmasked - masked, mean pnl/episode, 95% t-interval): +0.5737% [+0.4402%, +0.7071%]
   pre-cutoff  (60 dates): +1.0791% [+0.9371%, +1.2210%]; gap / mean|r| +0.7468
   post-cutoff (60 dates): +0.0683% [-0.0679%, +0.2044%]; gap / mean|r| +0.0453
   pre - post: +1.0108% [+0.8162%, +1.2055%]
+Gap, drift-adjusted (pnl on r - mean r of the part): pre +1.0752% [+0.9311%, +1.2193%]; post +0.0690% [-0.0670%, +0.2049%]; pre - post +1.0062% [+0.8102%, +1.2023%]
 Unmasked: mean pnl +0.4841%, hit rate 0.675, abstain rate 0.020, unparseable 45
 Masked:   mean pnl -0.0895%, hit rate 0.480, abstain rate 0.019, unparseable 43
+Net long rate, masked - unmasked: whole-run +5.3 pp, pre +7.0 pp, post +3.7 pp
 ```
 
 Output of the second command (headline lines):
 
 ```text
 Verdict: no evidence
-  gap_pre CI low -0.000173, (gap_pre - gap_post) CI low -0.001463: both must be > 0
+  raw: gap_pre CI low -0.000173, (gap_pre - gap_post) CI low -0.001463; drift-adjusted: gap_pre CI low -0.000180, (gap_pre - gap_post) CI low -0.001472: all four must be > 0
 Episodes: 2400 on 120 dates; cutoff 2025-01-02
 Gap (unmasked - masked, mean pnl/episode, 95% t-interval): +0.0839% [-0.0045%, +0.1724%]
   pre-cutoff  (60 dates): +0.0996% [-0.0173%, +0.2166%]; gap / mean|r| +0.0690
   post-cutoff (60 dates): +0.0683% [-0.0679%, +0.2044%]; gap / mean|r| +0.0453
   pre - post: +0.0314% [-0.1463%, +0.2091%]
+Gap, drift-adjusted (pnl on r - mean r of the part): pre +0.1000% [-0.0180%, +0.2181%]; post +0.0690% [-0.0670%, +0.2049%]; pre - post +0.0310% [-0.1472%, +0.2093%]
 Unmasked: mean pnl -0.0056%, hit rate 0.497, abstain rate 0.020, unparseable 45
 Masked:   mean pnl -0.0895%, hit rate 0.480, abstain rate 0.019, unparseable 43
+Net long rate, masked - unmasked: whole-run +1.5 pp, pre -0.7 pp, post +3.7 pp
 ```
 
 Both commands exit with code 0, because each run reached a verdict.
@@ -170,7 +174,8 @@ The default live setting (5 tickers x 10 dates) gives only 5 dates in each part.
 
 The probe cannot remove these effects.
 
-- **A masking effect that is constant in behaviour.** Masking can change how an honest model behaves. For example, the model can abstain 10% more often when masked. The pre - post difference cancels only a masking effect that is constant in pnl. A behaviour effect costs pnl in proportion to |r|. A more volatile pre-cutoff period then gives pre - post > 0 with no memory. The report gives gap / mean|r| for each period. If the raw gaps differ but the scaled gaps agree, read the difference as volatility, not memory.
+- **A masking effect that is constant in behaviour.** Masking can change how an honest model behaves. For example, the model can abstain 10% more often when masked. The pre - post difference cancels only a masking effect that is constant in pnl. A behaviour effect costs pnl in proportion to |r|. A more volatile pre-cutoff period then gives pre - post > 0 with no memory. The report gives gap / mean|r| for each period. If the raw gaps differ but the scaled gaps agree, read the difference as volatility, not memory. This check works only for abstain-type changes. It does not work for a change in trade direction (see the next item).
+- **A change in trade direction under masking.** A model can be more bullish on real tickers than on `ASSET_nn` names. Then the gap grows by the change in net long rate times the mean return (drift) of the period. This effect scales with mean r, not with mean |r|. The gap / mean|r| check does not show it. A survivor-only panel usually drifts up before the cutoff. So this effect gives pre - post > 0 with no memory. An earlier version of this README said gap / mean|r| was the check for such effects. That was wrong for this case. The probe now also computes a drift-adjusted gap. It scores pnl on r minus the mean r of the period. The verdict "memorisation suspected" needs the raw gap and the drift-adjusted gap to pass. The report also shows the net long rate of each arm and warns when the direction change explains 25% or more of a positive pre - post.
 - **Non-string keys survive masking.** The probe keeps the exact return path, because a legitimate agent can use it. A whole-week date shift keeps the pattern of holiday gaps. A model can recognise an episode from either. Both effects bias the probe toward under-detection.
 - **Masked dates are in the real past.** The probe shifts dates back by more than the panel span. They are not in a fictional calendar. A model can know the market of those dates too.
 - **The panel must be rectangular.** Every ticker must have every date. The universe is survivor-only. Delisted tickers cannot be included.
@@ -183,7 +188,7 @@ Version 0.1 supports only Claude, only `claude-haiku-5-5`, only a price path in 
 
 ## Validation
 
-`uv run pytest -q` printed `175 passed in 20.18s` in this checkout.
+Some tests need the `live` extra (the `anthropic` package). `uv run --all-extras pytest -q` printed `190 passed in 24.05s` in this checkout. Without the extra, in a fresh environment, `uv run pytest -q` printed `186 passed, 4 skipped in 21.48s`: it skips the 4 tests that need `anthropic`.
 
 The calibration test (`tests/test_calibration.py`) runs the full pipeline on the honest and memorising mocks. The panel has 8 tickers and 60 dates. The test printed these numbers:
 
@@ -191,7 +196,7 @@ The calibration test (`tests/test_calibration.py`) runs the full pipeline on the
 |---|---|---|
 | Gap CI coverage over 2,000 null seeds (nominal 95%) | 0.9470 | between 0.94 and 0.96 |
 | Pre - post CI coverage over 2,000 null seeds | 0.9495 | between 0.94 and 0.96 |
-| False "memorisation suspected" rate over 2,000 null seeds | 0.0095 | not more than 0.05 |
+| False "memorisation suspected" rate over 2,000 null seeds | 0.0080 | not more than 0.05 |
 | Memorising mock detected in 500 seeds | 1.0000 | not less than 0.95 |
 
 The earlier percentile bootstrap interval covered 0.938 and 0.9345 on the same kind of test. This is why the verdict uses the t interval.
@@ -201,7 +206,7 @@ An independent validation protocol checked the main claims. It also found proble
 For the design, the alternatives that the authors rejected, and the failure modes, see [docs/DESIGN.md](docs/DESIGN.md).
 
 ```bash
-uv run pytest -q
+uv run --all-extras pytest -q
 uv run ruff check
 ```
 

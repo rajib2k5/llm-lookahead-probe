@@ -149,6 +149,12 @@ def print_headline(rep: dict, paths) -> None:
         extra = "" if scaled is None else f"; gap / mean|r| {scaled:+.4f}"
         print(f"  {label} ({part['n_dates']} dates): {_ci(part['gap'])}{extra}")
     print(f"  pre - post: {_ci(rep['diff_pre_minus_post'])}")
+    adj = rep.get("drift_adjusted")
+    if adj:
+        print(
+            f"Gap, drift-adjusted (pnl on r - mean r of the part): pre {_ci(adj['pre'])}; "
+            f"post {_ci(adj['post'])}; pre - post {_ci(adj['diff_pre_minus_post'])}"
+        )
     ab = lambda a: "n/a" if a["abstain_rate"] is None else f"{a['abstain_rate']:.3f}"  # noqa: E731
     for label, a in (("Unmasked:", u), ("Masked:  ", m)):
         print(
@@ -158,6 +164,14 @@ def print_headline(rep: dict, paths) -> None:
     sh = rep.get("abstain_shift")
     if sh and sh["flag"]:
         print(f"Warning: abstain rate changes under masking: {sh['note']}")
+    ds = rep.get("direction_shift")
+    if ds:
+        print(
+            "Net long rate, masked - unmasked: "
+            + ", ".join(f"{k} {v * 100:+.1f} pp" for k, v in ds["by_part"].items())
+        )
+        if ds["flag"]:
+            print(f"Warning: trade direction changes under masking: {ds['note']}")
     if "usage" in rep:
         us = rep["usage"]
         print(

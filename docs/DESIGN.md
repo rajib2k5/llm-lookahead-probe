@@ -36,8 +36,12 @@ level).
 | Measures | Inflation of the actual decision pipeline | Confounded difference | Knowledge, not backtest inflation |
 | Cost (live) | 2 calls per episode | 1 call per episode | 1 call per fact |
 
-Recommendation: **A**, with B's cutoff split layered on top. Pairing removes the regime confound
-(both arms see the same episode and are scored on the same realised return), and the cutoff split
+Recommendation: **A**, with B's cutoff split layered on top. Pairing scores both arms on the same
+episode and the same realised return, so a regime cannot move one arm and not the other. It does
+**not** remove the regime confound in general: an earlier version of this document said it did,
+and that was wrong. If masking changes the model's trade direction (for example more LONG on real
+tickers than on `ASSET_nn`), the gap picks up that direction change times the period's drift,
+which is a regime effect (see Limits, "direction bias times drift"). The cutoff split
 adds a second, independent prediction: memorisation should create a gap before the cutoff and none
 after. C is a useful later add-on for diagnosis but does not answer "is my backtest inflated".
 What would change the decision: if masked prompts measurably change a non-memorising model's
@@ -104,13 +108,41 @@ arm that does not trade earns pnl 0, so an always-ABSTAIN model (or one that abs
 masked) would otherwise get gap 0 and "no evidence", or even a false "suspected" (see Limits).
 Else "insufficient data" if pre or post has fewer than 20 decision dates. Else
 "memorisation suspected" iff lower CI bound of gap_pre > 0 AND lower CI bound of
-(gap_pre − gap_post) > 0. Otherwise "no evidence". Decision dates are sampled stratified, half
+(gap_pre − gap_post) > 0, for both the raw gap and the drift-adjusted gap (below). Otherwise
+"no evidence". Decision dates are sampled stratified, half
 before and half on/after the cutoff, when the data allows. hit_rate = hits / trades; a trade is
 LONG or SHORT; a trade on r = 0 is a miss; ABSTAIN is not a trade.
 
+Drift-adjusted gap. pnl = +r for LONG, −r for SHORT, 0 for ABSTAIN. A model whose action does not
+depend on r (given the arm) earns E[pnl] = net_long × E[r], where net_long = long rate − short
+rate. So a masking-induced direction change adds (net_long_u − net_long_m) × mean r to the gap,
+with no memory. The report gives this as `gap_explained_by_direction_bias` per part, next to
+`direction_shift` (masked − unmasked net long rate) and each part's `mean_r`. The drift-adjusted
+gap scores pnl on r − mean r of the part, which equals raw gap − (net_long_u − net_long_m) × mean r
+exactly and so removes that term exactly. It keeps memory: a model that knows the sign of r still
+earns E[s(r − μ)] > 0; it loses only net_long_shift × μ of a real memoriser's gain.
+
+Decision: require both raw and drift-adjusted gaps to pass, and also warn (report.md, CLI,
+`verdict_reason`) when |direction shift| > 10 pp in any part AND the observed pre − post is > 0
+AND the bias × drift part of pre − post is ≥ 25% of it. The direction shift is NOT a gate: real
+memory also changes direction (a memoriser goes LONG more in an up-drifting pre period), so a
+gate would cost power. Rejected: (1) cross-sectional demeaning per date (r − that date's mean r).
+It also removes the term for an r-independent action, but it removes every date-level effect too,
+so a model that remembers the market's direction on a date (LONG on every ticker of an up day)
+would score zero; part-mean demeaning keeps that. It would win if date-level recall were shown not
+to matter and per-date market shocks were the main noise. (2) Warning only, verdict on raw gap:
+leaves the reviewer's false positive in place. (3) Verdict on the adjusted gap alone: equivalent in
+the measurements below; requiring both is the more conservative reading and costs ≤ 0.4 pp power.
+
 Measured on the offline mocks (8 tickers × 60 dates, 2,000 null seeds, 500 power seeds,
 `tests/test_calibration.py`): gap coverage 0.9470, pre − post coverage 0.9495, false
-"memorisation suspected" rate 0.0095, power against the memorising mock 1.0000. The mock's power
+"memorisation suspected" rate 0.0080 (0.0095 before the drift-adjusted gate; the CIs are
+unchanged), power against the memorising mock 1.0000. Reviewer's case (model LONG unmasked,
+SHORT masked; 8 of 10 tickers × 200 dates; pre drift +0.2%/day, post 0): 8 of 40 seeds
+"memorisation suspected" before, 0 of 40 (and 0 of 200) after, with the direction warning in 36 of
+40. Memorising mock with recall p = 0.55 on that drifting panel (300 seeds): raw-only 0.9667,
+raw + adjusted 0.9633. Direction warning on the honest mock: 0.042 (500 seeds, synthetic panel),
+0.053 (300 seeds, drifting panel). The mock's power
 says nothing about real models: the memorising mock recalls 75% of directions exactly, which no
 real model is known to do.
 
@@ -162,7 +194,18 @@ real model is known to do.
   if it is constant in pnl. An effect constant in behaviour (e.g. abstaining 10% more often when
   masked) costs pnl in proportion to |r|, so a more volatile pre-cutoff period gives
   pre − post > 0 with no memory. The report gives gap / mean|r| for each period; if the raw gaps
-  differ but the scaled gaps agree, read the difference as volatility, not memory.
+  differ but the scaled gaps agree, read the difference as volatility, not memory. This check
+  covers abstain-type changes only, not direction changes (next item).
+- **Direction bias times drift.** If masking changes the trade direction (e.g. bullish on
+  familiar real tickers, neutral or bearish on `ASSET_nn`), the gap gains
+  (net_long_u − net_long_m) × mean r. This scales with the period's mean r (drift), not mean |r|,
+  so gap / mean|r| does not reveal it, and the abstain-shift flag stays off. A survivor-only panel
+  drifts up before the cutoff, so it gives pre − post > 0 with no memory. Measured before this fix:
+  8 of 40 seeds "memorisation suspected" in the reviewer's case. Handling: the verdict also requires
+  the drift-adjusted gap to pass (0 of 40 after), and the report warns when the direction shift
+  explains ≥ 25% of a positive pre − post. Not removed: a direction bias times a per-date market
+  move is noise that the CI covers; and drift is estimated from the sampled episodes, so the
+  adjustment uses the sample's mean r, not the true drift.
 - **Non-string keys survive masking.** The exact return path is kept (it is what a legitimate
   agent may use), and a whole-week date shift keeps the pattern of holiday gaps. A model could
   recognise an episode from either. Both bias toward under-detection.

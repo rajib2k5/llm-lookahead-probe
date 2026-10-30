@@ -52,18 +52,26 @@ def test_ratio_draws_weight_dates_by_episode_count():
 
 
 def make_records(n_dates_pre, n_dates_post, gap_pre, gap_post, n_tickers=5, seed=0):
-    """Records whose per-episode pnl difference has the requested mean in each part."""
+    """Records whose per-episode pnl difference has the requested mean in each part.
+
+    r has a random sign and |r| ~ 0.01, so mean r ~ 0. The unmasked arm "remembers" the sign of r
+    (earns |r|); the masked arm gets the sign right with probability q. The gap therefore comes from
+    knowing r, not from a direction bias. Up to a4fdd39 the fixture used r > 0 always
+    with unmasked LONG, which is exactly the no-memory direction-bias x drift case of
+    tests/test_direction_bias.py and is no longer (correctly) read as memorisation."""
     rng = np.random.default_rng(seed)
     out = []
     for k in range(n_dates_pre + n_dates_post):
         d = (CUT - timedelta(days=n_dates_pre - k)) if k < n_dates_pre else CUT + timedelta(days=k)
         gap = gap_pre if d < CUT else gap_post
         for j in range(n_tickers):
-            r = abs(rng.normal(0.01, 0.002))
-            # unmasked LONG earns +r; masked earns +r with prob q where q chosen to give mean gap
+            r = abs(rng.normal(0.01, 0.002)) * (1 if rng.random() < 0.5 else -1)
+            right = Action.LONG if r > 0 else Action.SHORT
+            wrong = Action.SHORT if r > 0 else Action.LONG
+            # unmasked earns +|r|; masked earns +|r| with prob q where q chosen to give mean gap
             q = 1 - gap / (2 * 0.01)
-            am = Action.LONG if rng.random() < q else Action.SHORT
-            out.append(EpisodeResult(f"T{j}", d, r, Action.LONG, True, am, True))
+            am = right if rng.random() < q else wrong
+            out.append(EpisodeResult(f"T{j}", d, r, right, True, am, True))
     return out
 
 
