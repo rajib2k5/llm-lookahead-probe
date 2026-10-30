@@ -305,6 +305,24 @@ def test_masked_abstain_unmasked_long_is_an_invalid_run():
     assert "masked arm" in s["verdict_reason"]
 
 
+def test_pre_only_masked_abstain_with_positive_returns_is_an_invalid_run():
+    # Pre: unmasked always LONG, masked always ABSTAIN, r > 0, so the paired gap is mean r > 0 in
+    # pre and 0 in post (both arms LONG). With a raw-gap-only rule and no ABSTAIN gate this read
+    # "memorisation suspected"; the model only declined to trade when masked.
+    rng = np.random.default_rng(0)
+    recs = []
+    for k in range(80):
+        d = CUT - timedelta(days=40 - k) if k < 40 else CUT + timedelta(days=k)
+        for j in range(5):
+            r = 0.01 + abs(rng.normal(0, 0.005))
+            am = Action.ABSTAIN if k < 40 else Action.LONG
+            recs.append(EpisodeResult(f"T{j}", d, r, Action.LONG, True, am, True))
+    s = summarise(recs, CUT, 0, 0.95, seed=0)
+    assert s["pre"]["gap"]["low"] > 0 and s["diff_pre_minus_post"]["low"] > 0  # raw gap alone passes
+    assert s["verdict"] == "invalid run"
+    assert "too few trades" in s["verdict_reason"] and "pre" in s["verdict_reason"]
+
+
 def test_abstain_rate_at_the_threshold_is_still_a_valid_run():
     # Every 2nd record abstains in both arms = exactly MAX_ABSTAIN_RATE: allowed (rule is "exceeds").
     assert MAX_ABSTAIN_RATE == 0.50

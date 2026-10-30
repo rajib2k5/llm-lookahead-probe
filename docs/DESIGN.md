@@ -129,10 +129,14 @@ memory also changes direction (a memoriser goes LONG more in an up-drifting pre 
 gate would cost power. Rejected: (1) cross-sectional demeaning per date (r − that date's mean r).
 It also removes the term for an r-independent action, but it removes every date-level effect too,
 so a model that remembers the market's direction on a date (LONG on every ticker of an up day)
-would score zero; part-mean demeaning keeps that. It would win if date-level recall were shown not
-to matter and per-date market shocks were the main noise. (2) Warning only, verdict on raw gap:
-leaves the reviewer's false positive in place. (3) Verdict on the adjusted gap alone: equivalent in
-the measurements below; requiring both is the more conservative reading and costs ≤ 0.4 pp power.
+would score zero; part-mean demeaning keeps that. Measured trade-off: a market-direction recaller
+falls from 0.203 detected to 0.015 under per-date demeaning, but a bull-biased ticker memoriser
+rises from 0.018 to 0.207. It would win if date-level recall were shown not to matter and per-date
+market shocks were the main noise. (2) Warning only, verdict on raw gap:
+leaves the reviewer's false positive in place. (3) Verdict on the adjusted gap alone: not
+equivalent. The raw gate can only add rejections, and it did cost power for a bull-biased
+memoriser (see Limits, "direction bias times drift"); but the raw-only rule has the false positive,
+so both stay for v0.1.
 
 Measured on the offline mocks (8 tickers × 60 dates, 2,000 null seeds, 500 power seeds,
 `tests/test_calibration.py`): gap coverage 0.9470, pre − post coverage 0.9495, false
@@ -206,6 +210,22 @@ real model is known to do.
   explains ≥ 25% of a positive pre − post. Not removed: a direction bias times a per-date market
   move is noise that the CI covers; and drift is estimated from the sampled episodes, so the
   adjustment uses the sample's mean r, not the true drift.
+  The adjusted test is conservative when masking shifts direction. Its standard error includes
+  Δnl² × Var(per-date mean r), where Δnl is the net long shift, but its point estimate does not
+  carry that term. Null coverage of the adjusted interval is 0.996 (moderate shift, 0 drift) to
+  1.000 (strong shift, +0.3%/day), so there are no extra false positives, but power drops for a
+  memoriser that is also bull-biased. 8ae7bf5 claimed that requiring both raw and adjusted gates
+  costs ≤ 0.4 pp power. That was wrong: it was measured only on a mock with no direction bias.
+  Measured (memorising mock, recall p, with the fallback answer when it does not recall), raw-only
+  vs shipped rule: p = 0.15, coin-flip fallback: 0.190 vs 0.177; p = 0.15, LONG fallback, +0.2%/day
+  drift: 0.320 vs 0.010; p = 0.15, LONG fallback, 0 drift: 0.095 vs 0.000; p = 0.30, LONG
+  fallback, +0.2%/day: 0.695 vs 0.357. So "no evidence" can miss a memoriser that is also bullish
+  on real names. Also not removed by part-mean demeaning: a ticker-specific bias times a
+  ticker-specific drift (for example LONG on recognised tickers that drifted up), and masking-
+  dependent behaviour correlated with r (momentum-like). Both exceed a 5% false-positive rate
+  only at extreme cross-ticker drift spreads (sd of 0.4–0.6%/day or more). Planned fix for v0.2:
+  regression adjustment. Within each part, regress the per-date differences on the per-date mean r
+  and test the intercept with its regression standard error.
 - **Non-string keys survive masking.** The exact return path is kept (it is what a legitimate
   agent may use), and a whole-week date shift keeps the pattern of holiday gaps. A model could
   recognise an episode from either. Both bias toward under-detection.

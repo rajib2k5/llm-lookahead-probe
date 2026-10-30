@@ -46,7 +46,10 @@ MAX_UNPARSEABLE_RATE = 0.10
 MAX_ABSTAIN_RATE = 0.50
 # Reported, not gated: |abstain rate (masked) - abstain rate (unmasked)| above this is flagged as a
 # behaviour change under masking. Such a change moves pnl in proportion to |r| and can produce a
-# gap on its own (tests/test_stats.py shows a pre-only masked abstain giving a false "suspected").
+# gap on its own: tests/test_stats.py::test_pre_only_masked_abstain_with_positive_returns_is_an_invalid_run
+# has a masked arm that abstains on every pre-cutoff episode (unmasked always LONG, r > 0); a rule on
+# the raw gap alone, without the ABSTAIN gate, called that "suspected". The drift-adjusted gate
+# alone would also reject it, but the run is invalid, not "no evidence".
 ABSTAIN_SHIFT_FLAG = 0.10
 
 # Direction bias under masking. A model whose action does not depend on r, given the arm, earns

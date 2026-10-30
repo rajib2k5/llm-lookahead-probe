@@ -166,3 +166,145 @@ def test_no_direction_warning_when_the_bias_pushes_pre_minus_post_below_zero():
     s = summarise(recs, CUT, 0, 0.95, seed=0)
     assert s["diff_pre_minus_post"]["estimate"] < 0
     assert s["direction_shift"]["flag"] is False
+
+
+# ---- gate and warning logic, pinned by mutation review of 8ae7bf5 -------------------------------
+
+
+def _skill_records(drift_pre: float, skill: float, seed: int, n_dates: int = 40, n_tickers: int = 8):
+    """Pre: masked always LONG; unmasked LONG, except on a `skill` share of episodes where it
+    knows the sign of r. Post: both arms always LONG (gap 0)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in range(2 * n_dates):
+        d = CUT - timedelta(days=n_dates - k) if k < n_dates else CUT + timedelta(days=k)
+        pre = d < CUT
+        shock = (drift_pre if pre else 0.0) + rng.normal(0, 0.01)
+        for j in range(n_tickers):
+            r = shock + rng.normal(0, 0.015)
+            au = Action.LONG
+            if pre and rng.random() < skill:
+                au = Action.LONG if r > 0 else Action.SHORT
+            out.append(EpisodeResult(f"T{j}", d, r, au, True, Action.LONG, True))
+    return out
+
+
+def test_verdict_needs_the_raw_gate_too_when_only_the_adjusted_gate_passes():
+    # Masked arm is LONG everywhere in a strongly up-drifting pre period, so its pnl carries the
+    # drift and the raw gap is dragged down; the drift-adjusted gap removes that and passes.
+    s = summarise(_skill_records(0.02, 0.1, seed=1), CUT, 0, 0.95, seed=0)
+    assert s["drift_adjusted"]["pre"]["low"] > 0 and s["drift_adjusted"]["diff_pre_minus_post"]["low"] > 0
+    assert not (s["pre"]["gap"]["low"] > 0 and s["diff_pre_minus_post"]["low"] > 0)
+    assert s["verdict"] == "no evidence"
+    assert "all four must be > 0" in s["verdict_reason"]
+
+
+def _constant_shift_records(
+    masked_short_share: float, drift_pre: float, n_dates: int = 40, n_tickers: int = 20
+):
+    """Unmasked always LONG; masked SHORT on a fixed share of each date's tickers, else LONG.
+    r is the pre drift plus a small deterministic wobble (pre-post > 0, no memory)."""
+    n_short = round(masked_short_share * n_tickers)
+    out = []
+    for k in range(2 * n_dates):
+        d = CUT - timedelta(days=n_dates - k) if k < n_dates else CUT + timedelta(days=k)
+        base = (drift_pre if d < CUT else 0.0) + 0.002 * ((k % 5) - 2)
+        for j in range(n_tickers):
+            r = base + 0.001 * ((j % 4) - 1.5)
+            am = Action.SHORT if j < n_short else Action.LONG
+            out.append(EpisodeResult(f"T{j}", d, r, Action.LONG, True, am, True))
+    return out
+
+
+def test_no_direction_warning_for_a_small_shift_even_if_it_explains_the_whole_gap():
+    # Masked is SHORT on 1 ticker in 40: net long shift -5 pp is below the 10 pp limit...
+    s = summarise(_constant_shift_records(0.025, 0.01, n_tickers=40), CUT, 0, 0.95, seed=0)
+    ds = s["direction_shift"]
+    assert ds["by_part"]["pre"] == pytest.approx(-0.05)
+    # ...although the shift explains (nearly) all of a positive pre - post.
+    assert ds["observed_pre_minus_post"] > 0
+    assert ds["explained_share_of_pre_minus_post"] > 0.9
+    assert ds["flag"] is False
+    assert "Warning: trade direction changes" not in s["verdict_reason"]
+
+
+def _memory_records(n_dates: int = 40, n_tickers: int = 20):
+    """Pre: unmasked knows the sign of r, masked SHORT on 60% / LONG on 40% of tickers (net long
+    shift about -20 pp). Post: both arms alike. Pre has a tiny positive drift, post none, so the
+    bias x drift part of pre - post is positive but a small share of the memory gap."""
+    out = []
+    for k in range(2 * n_dates):
+        d = CUT - timedelta(days=n_dates - k) if k < n_dates else CUT + timedelta(days=k)
+        pre = d < CUT
+        base = (0.0005 if pre else 0.0) + 0.002 * ((k % 5) - 2)
+        for j in range(n_tickers):
+            r = base + 0.01 * (1 if j % 2 == 0 else -1) + 0.0003 * j
+            if pre:
+                au = Action.LONG if r > 0 else Action.SHORT
+                am = Action.SHORT if j % 5 < 3 else Action.LONG
+            else:
+                au = am = Action.LONG
+            out.append(EpisodeResult(f"T{j}", d, r, au, True, am, True))
+    return out
+
+
+def test_no_direction_warning_for_a_large_shift_that_explains_a_small_share():
+    s = summarise(_memory_records(), CUT, 0, 0.95, seed=0)
+    ds = s["direction_shift"]
+    assert abs(ds["by_part"]["pre"]) > 0.10
+    assert ds["observed_pre_minus_post"] > 0
+    assert 0 <= ds["explained_pre_minus_post"] < 0.25 * ds["observed_pre_minus_post"]
+    assert ds["flag"] is False
+    assert "Warning: trade direction changes" not in s["verdict_reason"]
+
+
+def _varying_shift_records(n_dates: int = 40, n_tickers: int = 8, seed: int = 3):
+    """Unmasked LONG; masked SHORT on a share of tickers that changes from date to date, so the
+    drift-adjusted per-date means are not the raw per-date means shifted by a constant."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for k in range(2 * n_dates):
+        d = CUT - timedelta(days=n_dates - k) if k < n_dates else CUT + timedelta(days=k)
+        shock = (0.01 if d < CUT else 0.0) + rng.normal(0, 0.01)
+        n_short = (k * 3) % (n_tickers + 1)
+        for j in range(n_tickers):
+            r = shock + rng.normal(0, 0.015)
+            am = Action.SHORT if j < n_short else Action.LONG
+            out.append(EpisodeResult(f"T{j}", d, r, Action.LONG, True, am, True))
+    return out
+
+
+def _t_ci(means: np.ndarray, level: float = 0.95):
+    g = len(means)
+    se = means.std(ddof=1) / np.sqrt(g)
+    est = means.mean()
+    half = stats.t_quantile(1 - (1 - level) / 2, g - 1) * se
+    return est, est - half, est + half, se
+
+
+def test_adjusted_ci_is_built_from_adjusted_per_date_values():
+    recs = _varying_shift_records()
+    s = summarise(recs, CUT, 0, 0.95, seed=0)
+    pnl = stats.pnl
+    adj_means = {}
+    for name, keep in (("pre", lambda e: e.date < CUT), ("post", lambda e: e.date >= CUT)):
+        part = [e for e in recs if keep(e)]
+        mu = float(np.mean([e.r for e in part]))
+        by_date: dict = {}
+        for e in part:
+            by_date.setdefault(e.date, []).append(pnl(e.action_u, e.r - mu) - pnl(e.action_m, e.r - mu))
+        adj_means[name] = np.array([np.mean(v) for v in by_date.values()])
+        est, lo, hi, se = _t_ci(adj_means[name])
+        got = s["drift_adjusted"][name]
+        want = (est, lo, hi, se)
+        assert (got["estimate"], got["low"], got["high"], got["se"]) == pytest.approx(want, abs=1e-12)
+    # Precondition: adjusting changed the date-to-date spread, so a constant shift of the raw
+    # per-date means (same SE as raw) would not reproduce the adjusted SE.
+    assert abs(s["drift_adjusted"]["pre"]["se"] / s["pre"]["gap"]["se"] - 1) > 0.1
+    a, b = adj_means["pre"], adj_means["post"]
+    va, vb = a.var(ddof=1) / len(a), b.var(ddof=1) / len(b)
+    got = s["drift_adjusted"]["diff_pre_minus_post"]
+    assert got["se"] == pytest.approx(np.sqrt(va + vb), abs=1e-12)
+    df = (va + vb) ** 2 / (va**2 / (len(a) - 1) + vb**2 / (len(b) - 1))
+    half = stats.t_quantile(0.975, df) * np.sqrt(va + vb)
+    assert got["low"] == pytest.approx(a.mean() - b.mean() - half, abs=1e-12)
