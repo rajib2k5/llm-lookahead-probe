@@ -10,6 +10,14 @@ is 0.0049 at a true 0.95 and 0.0057 at a true 0.93. A correct 95% interval falls
 probability about 2%; an interval that really covers 93% reaches 0.94 with probability about 4%.
 So the band rejects a 93% interval, which the v0.1 band (0.90-0.99 over 200 seeds) could not:
 v0.1's percentile bootstrap measured 0.938 on this configuration and passed it.
+
+What the band cannot do: tell a t-interval from a z-interval. With 30 dates per part the two
+differ by little, and a z-interval measured 0.9405 here, inside the band. The choice of t over z
+(and of the G - 1 and Welch-Satterthwaite df) is pinned by the unit tests in tests/test_stats.py
+(t quantiles against printed tables, and the exact interval formulas), not by this test.
+
+The ABSTAIN gate (stats.MAX_ABSTAIN_RATE) does not move these numbers: both mocks abstain on
+about 2% of prompts (garbled answers), far below 50%.
 """
 
 import os

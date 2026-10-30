@@ -78,6 +78,36 @@ PER_REQUEST_OVERHEAD_TOKENS = 64
 # run that fails mid-way is resumed for free from the cache. estimate_cost multiplies by
 # (1 + max_retries) so the estimate stays an upper bound if this is ever raised.
 MAX_RETRIES = 0
+DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+
+def resolve_base_url() -> str:
+    """The API endpoint for this run: ANTHROPIC_BASE_URL if set and non-empty, else the public API.
+    default_client_factory passes this value to the SDK explicitly, and the CLI puts the same value
+    in the cache key, so the endpoint that answered and the endpoint in the key cannot differ (an
+    SDK profile's base URL is therefore not used)."""
+    return os.environ.get("ANTHROPIC_BASE_URL") or DEFAULT_BASE_URL
+
+
+class LiveAPIError(RuntimeError):
+    """An API request failed (rate limit, overload, server or connection error). With MAX_RETRIES
+    = 0 the SDK does not retry, so the run stops here. Every answer received before the failure is
+    already in the cache (each one is written as soon as it arrives), so re-running the same
+    command resumes: cached prompts are not sent again and cost nothing."""
+
+    def __init__(self, calls_made: int, cause: BaseException) -> None:
+        self.calls_made = calls_made
+        super().__init__(f"{type(cause).__name__}: {cause}")
+
+
+def _api_error_types() -> tuple[type[BaseException], ...]:
+    """The SDK's own error base class, if the SDK is installed. Only these are turned into a
+    resumable LiveAPIError; anything else (a bug, a bad argument) still surfaces as itself."""
+    try:
+        import anthropic
+    except ImportError:  # pragma: no cover - depends on environment
+        return ()
+    return (anthropic.APIError,)
 
 
 @dataclass(frozen=True)
@@ -134,21 +164,33 @@ class ResponseCache:
 
     Directory handling: a directory this class creates gets mode 0700. An existing directory is
     used as it is (its mode is never changed, so `--cache-dir ~` cannot alter the home directory),
-    but one that is group- or world-writable is refused, because another user could plant
-    answers in it. With `create=False` a missing directory is not created: every lookup misses and
-    `put` refuses (used by the live dry run, which must not touch the disk).
+    but one that is owned by another user, or group- or world-writable, is refused, because
+    another user could plant answers in it (e.g. a /tmp directory someone else pre-created at
+    0755). The cache key covers the API endpoint as well as the request. With `create=False` a
+    missing directory is not created: every lookup misses and `put` refuses (used by the live dry
+    run, which must not touch the disk).
 
     Files are 0600 and written atomically (temp file + rename), so a crash cannot leave a
     half-written entry.
     """
 
-    def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
+    def __init__(
+        self, root: str | os.PathLike[str], *, create: bool = True, endpoint: str = DEFAULT_BASE_URL
+    ) -> None:
         self.root = Path(root)
+        self.endpoint = endpoint
         if self.root.is_symlink():
             raise ValueError(f"refusing to use symlinked cache directory {self.root}")
         self._exists = self.root.is_dir()
         if self._exists:
-            mode = stat.S_IMODE(self.root.stat().st_mode)
+            st = self.root.stat()
+            if st.st_uid != os.getuid():
+                raise ValueError(
+                    f"refusing to use cache directory {self.root}: it is owned by uid {st.st_uid}, "
+                    f"not by you (uid {os.getuid()}); its owner could plant answers. Use a private "
+                    "directory you own"
+                )
+            mode = stat.S_IMODE(st.st_mode)
             if mode & (stat.S_IWGRP | stat.S_IWOTH):
                 raise ValueError(
                     f"refusing to use cache directory {self.root}: it is group- or world-writable "
@@ -162,9 +204,11 @@ class ResponseCache:
             os.chmod(self.root, 0o700)  # mkdir's mode is filtered by the umask; we created it
             self._exists = True
 
-    @staticmethod
-    def key(request: dict) -> str:
-        canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    def key(self, request: dict) -> str:
+        """sha256 of the request AND the endpoint, so answers from a local stub server are never
+        served on a run against the real API (or the other way round)."""
+        keyed = {"endpoint": self.endpoint, "request": request}
+        canonical = json.dumps(keyed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def path_for(self, request: dict) -> Path:
@@ -231,8 +275,11 @@ class ClaudeModel:
             raise RuntimeError(f"API call budget of {self.max_calls} calls exhausted; refusing to spend more")
         if self._client is None:
             self._client = self._get_client()
-        self.calls += 1
-        resp = self._client.messages.create(**request)
+        self.calls += 1  # counted before sending: a failed request may still have been billed
+        try:
+            resp = self._client.messages.create(**request)
+        except _api_error_types() as exc:
+            raise LiveAPIError(self.calls - 1, exc) from exc
         # A refusal or an empty reply yields "", which the agent counts as unparseable (ABSTAIN).
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         tin, tout = int(resp.usage.input_tokens), int(resp.usage.output_tokens)
@@ -277,4 +324,6 @@ def default_client_factory(api_key: str) -> Any:
         raise RuntimeError(
             "live mode needs the 'live' extra: pip install 'llm-lookahead-probe[live]'"
         ) from exc
-    return anthropic.Anthropic(api_key=api_key, max_retries=MAX_RETRIES, timeout=60.0)
+    return anthropic.Anthropic(
+        api_key=api_key, base_url=resolve_base_url(), max_retries=MAX_RETRIES, timeout=60.0
+    )

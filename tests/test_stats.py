@@ -5,6 +5,7 @@ import pytest
 
 from llm_lookahead_probe.prompt import Action
 from llm_lookahead_probe.stats import (
+    MAX_ABSTAIN_RATE,
     MAX_UNPARSEABLE_RATE,
     MIN_DATES_PER_PART,
     EpisodeResult,
@@ -267,3 +268,93 @@ def test_hit_rate_counts_a_trade_on_a_zero_return_as_a_miss():
     s = summarise(recs, CUT, 0, 0.95, seed=0)
     assert s["arms"]["unmasked"]["hit_rate"] == pytest.approx(1 / 2)
     assert s["arms"]["masked"]["hit_rate"] is None  # no trades
+
+
+def _set_actions(recs, *, u=None, m=None, every=1):
+    """Replace the parsed answer of every `every`-th record in an arm (u or m) with `action`."""
+    out = []
+    for k, e in enumerate(recs):
+        if k % every == 0:
+            au = u if u is not None else e.action_u
+            am = m if m is not None else e.action_m
+            e = EpisodeResult(e.ticker, e.date, e.r, au, True, am, True)
+        out.append(e)
+    return out
+
+
+def test_a_model_that_always_abstains_is_an_invalid_run_not_no_evidence():
+    # Every answer is a valid ABSTAIN: gap 0 and CI [0, 0] by construction, not a measurement.
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), u=Action.ABSTAIN, m=Action.ABSTAIN)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+    assert "too few trades" in s["verdict_reason"]
+
+
+def test_masked_abstain_unmasked_long_is_an_invalid_run():
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), u=Action.LONG, m=Action.ABSTAIN)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+    assert "masked arm" in s["verdict_reason"]
+
+
+def test_abstain_rate_at_the_threshold_is_still_a_valid_run():
+    # Every 2nd record abstains in both arms = exactly MAX_ABSTAIN_RATE: allowed (rule is "exceeds").
+    assert MAX_ABSTAIN_RATE == 0.50
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), u=Action.ABSTAIN, m=Action.ABSTAIN, every=2)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "no evidence"
+    assert f"{MAX_ABSTAIN_RATE:.0%}" in s["verdict_rule"]
+
+
+def test_abstain_only_in_one_part_is_an_invalid_run():
+    pre = _set_actions(make_records(40, 0, 0.0, 0.0), m=Action.ABSTAIN)
+    post = [e for e in make_records(40, 40, 0.0, 0.0) if e.date >= CUT]
+    s = summarise(pre + post, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+    assert "pre" in s["verdict_reason"]
+
+
+def test_abstain_rate_difference_between_arms_is_reported_and_flagged_when_large():
+    # Masked arm abstains on 1 in 4 episodes, unmasked never: valid run, but behaviour changed.
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), m=Action.ABSTAIN, every=4)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "no evidence"
+    shift = s["abstain_shift"]
+    assert shift["masked_minus_unmasked"] == pytest.approx(0.25)
+    assert shift["flag"] is True
+    assert s["arms"]["masked"]["abstain_rate"] == pytest.approx(0.25)
+
+
+def test_small_abstain_rate_difference_is_not_flagged():
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), m=Action.ABSTAIN, every=20)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["abstain_shift"]["masked_minus_unmasked"] == pytest.approx(0.05)
+    assert s["abstain_shift"]["flag"] is False
+
+
+def _md(summary):
+    from llm_lookahead_probe.report import build_report, render_markdown
+
+    rep = build_report(
+        summary,
+        mode="offline",
+        model="m",
+        config={},
+        cutoff=CUT,
+        cutoff_source="t",
+        masked_prompts_checked=0,
+    )
+    return render_markdown(rep)
+
+
+def test_report_warns_about_a_large_abstain_shift_under_masking():
+    recs = _set_actions(make_records(40, 40, 0.0, 0.0), m=Action.ABSTAIN, every=4)
+    md = _md(summarise(recs, CUT, 2000, 0.95, seed=0))
+    assert "Warning: abstain rate changes under masking" in md
+    assert "+25.0" in md  # masked - unmasked, percentage points
+
+
+def test_report_has_no_abstain_warning_when_rates_match():
+    md = _md(summarise(make_records(40, 40, 0.0, 0.0), CUT, 2000, 0.95, seed=0))
+    assert "Warning: abstain rate" not in md
+    assert "Abstain rate" in md

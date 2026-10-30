@@ -37,10 +37,24 @@ MIN_RESAMPLES = 2000
 MIN_DATES_PER_PART = 20
 MAX_UNPARSEABLE_RATE = 0.10
 
+# Trade-count gate. ABSTAIN (which includes unparseable answers) earns pnl 0 in both arms, so an
+# arm that mostly abstains pins the gap near 0 by construction and "no evidence" would describe the
+# model's refusal to trade, not its memory. 50% is the point at which half or more of the
+# episodes cannot express a direction at all. It is deliberately loose: a cautious model that
+# abstains on a third of prompts still gets a verdict (its power is lower, which the CI width
+# shows). Measured effect on power: docs/DESIGN.md "Limits" (abstain gate).
+MAX_ABSTAIN_RATE = 0.50
+# Reported, not gated: |abstain rate (masked) - abstain rate (unmasked)| above this is flagged as a
+# behaviour change under masking. Such a change moves pnl in proportion to |r| and can produce a
+# gap on its own (tests/test_stats.py shows a pre-only masked abstain giving a false "suspected").
+ABSTAIN_SHIFT_FLAG = 0.10
+
 VERDICT_RULE = (
     "'invalid run' if, in the whole run or in the pre-cutoff or post-cutoff part, either arm has "
     f"more than {MAX_UNPARSEABLE_RATE:.0%} unparseable answers (refusals, empty or truncated "
-    "replies count as ABSTAIN and would otherwise hide a broken run as a zero gap); else "
+    "replies count as ABSTAIN and would otherwise hide a broken run as a zero gap), or either arm "
+    f"has more than {MAX_ABSTAIN_RATE:.0%} ABSTAIN answers including unparseable ones (too few "
+    "trades: a model that abstains has gap 0 by construction); else "
     "'insufficient data' if the pre-cutoff or post-cutoff part has fewer than "
     f"{MIN_DATES_PER_PART} decision dates; else 'memorisation suspected' if the lower CI bound "
     "of gap_pre > 0 AND the lower CI bound of (gap_pre - gap_post) > 0; otherwise 'no evidence'. "
@@ -245,12 +259,14 @@ def _arm_metrics(actions: list[Action], parsed: list[bool], r: np.ndarray) -> di
     trades = [(a, x) for a, x in zip(actions, r, strict=True) if a != Action.ABSTAIN]
     hits = sum((a == Action.LONG and x > 0) or (a == Action.SHORT and x < 0) for a, x in trades)
     n_unparseable = sum(not ok for ok in parsed)
+    n_abstain = sum(a == Action.ABSTAIN for a in actions)
     return {
         "mean_pnl": float(p.mean()) if len(p) else None,
         "hit_rate": hits / len(trades) if trades else None,
         "n_long": sum(a == Action.LONG for a in actions),
         "n_short": sum(a == Action.SHORT for a in actions),
-        "n_abstain": sum(a == Action.ABSTAIN for a in actions),
+        "n_abstain": n_abstain,
+        "abstain_rate": n_abstain / len(actions) if actions else None,
         "n_unparseable": n_unparseable,
         "unparseable_rate": n_unparseable / len(parsed) if parsed else None,
     }
@@ -282,6 +298,7 @@ def _require_balanced(records: list[EpisodeResult]) -> None:
 
 
 def _invalid_reason(arms_by_part: dict[str, dict]) -> str | None:
+    """Unparseable gate first (it names the more specific failure), then the trade-count gate."""
     for part, arms in arms_by_part.items():
         for arm in ("unmasked", "masked"):
             rate = arms[arm]["unparseable_rate"]
@@ -291,7 +308,36 @@ def _invalid_reason(arms_by_part: dict[str, dict]) -> str | None:
                     f"episodes (limit {MAX_UNPARSEABLE_RATE:.0%}); a gap measured on refusals or "
                     "empty replies says nothing about memory"
                 )
+    for part, arms in arms_by_part.items():
+        for arm in ("unmasked", "masked"):
+            rate = arms[arm]["abstain_rate"]
+            if rate is not None and rate > MAX_ABSTAIN_RATE:
+                return (
+                    f"invalid run: too few trades: {arm} arm answered ABSTAIN (or unparseable) on "
+                    f"{rate:.1%} of the {part} episodes (limit {MAX_ABSTAIN_RATE:.0%}); an arm that "
+                    "does not trade has pnl 0, so the gap would be 0 by construction"
+                )
     return None
+
+
+def _abstain_shift(arms_by_part: dict[str, dict]) -> dict:
+    """masked - unmasked abstain rate per part; flagged when any part exceeds ABSTAIN_SHIFT_FLAG."""
+    by_part = {
+        part: arms["masked"]["abstain_rate"] - arms["unmasked"]["abstain_rate"]
+        for part, arms in arms_by_part.items()
+    }
+    worst = max(by_part, key=lambda k: abs(by_part[k]))
+    return {
+        "masked_minus_unmasked": by_part["whole-run"],
+        "by_part": by_part,
+        "threshold": ABSTAIN_SHIFT_FLAG,
+        "flag": abs(by_part[worst]) > ABSTAIN_SHIFT_FLAG,
+        "note": (
+            f"largest |difference| {abs(by_part[worst]):.1%} in the {worst} episodes; above "
+            f"{ABSTAIN_SHIFT_FLAG:.0%} the model behaves differently when masked, which moves pnl "
+            "in proportion to |r| and can create a gap without any memory"
+        ),
+    }
 
 
 def _scaled(gap: float, recs: list[EpisodeResult]) -> dict:
@@ -342,9 +388,8 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
         diff = welch_interval(part_means["pre"], part_means["post"], level)
 
     arms_all = _arms(records)
-    invalid = _invalid_reason(
-        {"whole-run": arms_all} | {n: p["arms"] for n, p in parts.items() if "arms" in p}
-    )
+    arms_by_part = {"whole-run": arms_all} | {n: p["arms"] for n, p in parts.items() if "arms" in p}
+    invalid = _invalid_reason(arms_by_part)
     if invalid:
         verdict, reason = "invalid run", invalid
     elif parts["pre"]["n_dates"] < MIN_DATES_PER_PART or parts["post"]["n_dates"] < MIN_DATES_PER_PART:
@@ -381,6 +426,7 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
         "pre": parts["pre"],
         "post": parts["post"],
         "diff_pre_minus_post": diff.as_dict(level) if diff else None,
+        "abstain_shift": _abstain_shift(arms_by_part),
         "verdict": verdict,
         "verdict_reason": reason,
         "verdict_rule": VERDICT_RULE,
@@ -389,6 +435,8 @@ def summarise(records: list[EpisodeResult], cutoff: date, n_resamples: int, leve
             "level": level,
             "min_dates_per_part": MIN_DATES_PER_PART,
             "max_unparseable_rate": MAX_UNPARSEABLE_RATE,
+            "max_abstain_rate": MAX_ABSTAIN_RATE,
+            "abstain_shift_flag": ABSTAIN_SHIFT_FLAG,
         },
         "robustness": {"cluster_bootstrap": _bootstrap_block(records, part_recs, n_resamples, level, seed)},
     }

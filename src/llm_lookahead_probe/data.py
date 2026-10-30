@@ -37,8 +37,14 @@ CLOSE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 # Upper bound on a close. Masking multiplies prices by at most 6, so every masked price stays a
 # small, finite number that renders as plain d.dd text (no exponent, no inf).
 MAX_CLOSE = 1e7
-# Earliest allowed date. Masking shifts dates back by the panel span plus up to ~2 years; an early
-# date (e.g. year 0001) would underflow `datetime.date` and crash the run.
+# Lower bound on a close. Prompts show prices as d.dd; a sub-cent close renders as "0.00", which
+# shows the model a price of zero and, when the masked value also rounds to "0.00", fails the leak
+# check as a false leak on every factor redraw.
+MIN_CLOSE = 0.01
+# Earliest allowed date. This is a sanity bound on input, NOT the underflow guard: masking shifts
+# dates back by the panel span plus up to ~2 years, so a panel spanning ~1,900+ years (e.g. one
+# 9999-12-31 typo in a 1900 panel) still reaches below year 1. Masker.fit checks the span itself
+# and raises PriceDataError for that case.
 MIN_YEAR = 1900
 
 
@@ -147,7 +153,8 @@ def load_prices_csv(
     """Load and strictly validate a `date,ticker,close` CSV.
 
     Rules: exact header; ISO dates on or after MIN_YEAR-01-01; ticker matches TICKER_RE and is not
-    a reserved word; close matches CLOSE_RE (plain decimal), is positive and at most MAX_CLOSE;
+    a reserved word; close matches CLOSE_RE (plain decimal), is at least MIN_CLOSE (0.01) and at
+    most MAX_CLOSE;
     rows strictly increasing in (date, ticker), which also forbids
     duplicates; every ticker present on every date (rectangular); size limits on bytes, rows,
     tickers and line length. Raises PriceDataError naming the first failing line.
@@ -203,6 +210,11 @@ def load_prices_csv(
                 raise PriceDataError(f"line {lineno}: close must be finite")
             if close <= 0:
                 raise PriceDataError(f"line {lineno}: close must be positive")
+            if close < MIN_CLOSE:
+                raise PriceDataError(
+                    f"line {lineno}: close {cs} is below the minimum {MIN_CLOSE:.2f} (prompts show "
+                    "prices to the cent, so a sub-cent close would show as 0.00)"
+                )
             if close > MAX_CLOSE:
                 raise PriceDataError(f"line {lineno}: close {cs} exceeds the maximum {MAX_CLOSE:.0f}")
             key = (d, ticker)

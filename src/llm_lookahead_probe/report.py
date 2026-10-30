@@ -59,6 +59,10 @@ def _f(x, pct=False) -> str:
     return f"{x * 100:.3f}%" if pct else f"{x:.4f}"
 
 
+def _pp(x: float) -> str:
+    return f"{x * 100:+.1f} pp"
+
+
 def _ci(c: dict | None) -> str:
     if not c:
         return "n/a"
@@ -98,21 +102,33 @@ def render_markdown(rep: dict) -> str:
         "",
         "## Arms",
         "",
-        "| Arm | Mean pnl | Hit rate | Long | Short | Abstain | Unparseable |",
-        "|---|---|---|---|---|---|---|",
+        "| Arm | Mean pnl | Hit rate | Long | Short | Abstain | Abstain rate | Unparseable |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for name in ("unmasked", "masked"):
         a = rep["arms"][name]
         lines.append(
             f"| {name} | {_f(a['mean_pnl'], True)} | {_f(a['hit_rate'])} | {a['n_long']} | "
-            f"{a['n_short']} | {a['n_abstain']} | {a['n_unparseable']} |"
+            f"{a['n_short']} | {a['n_abstain']} | {_f(a['abstain_rate'], True)} | {a['n_unparseable']} |"
         )
+    sh = rep.get("abstain_shift")
+    if sh:
+        lines += [
+            "",
+            f"Abstain rate, masked minus unmasked: whole run {_pp(sh['masked_minus_unmasked'])}, "
+            + ", ".join(f"{k} {_pp(v)}" for k, v in sh["by_part"].items() if k != "whole-run")
+            + f" (flagged above {sh['threshold']:.0%}).",
+        ]
+        if sh["flag"]:
+            lines += ["", f"**Warning: abstain rate changes under masking.** {sh['note']}."]
     lines += [
         "",
         f"Interval: {rep['interval']['method']}. Each decision date is one observation because "
         "episodes on one date share the market move.",
         f"Unparseable answers count as ABSTAIN (pnl 0); above {rep['interval']['max_unparseable_rate']:.0%} "
-        "in either arm the run is invalid.",
+        "in either arm the run is invalid. Above "
+        f"{rep['interval']['max_abstain_rate']:.0%} ABSTAIN (including unparseable) in either arm "
+        "the run is invalid too: too few trades.",
     ]
     b = rep.get("robustness", {}).get("cluster_bootstrap")
     if b:

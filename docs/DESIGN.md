@@ -98,7 +98,11 @@ wrong; the calibration test would show it.
 Verdict. "invalid run" if, in the whole run or in the pre or post part, either arm has more than
 10% unparseable answers (refusals, empty or truncated replies). These count as ABSTAIN (pnl 0),
 so without this rule a run where every answer failed would show gap 0, CI [0, 0] and "no
-evidence". Else "insufficient data" if pre or post has fewer than 20 decision dates. Else
+evidence". Also "invalid run" if, in the whole run or in the pre or post part, either arm
+answers ABSTAIN (unparseable answers included) on more than 50% of episodes: too few trades. An
+arm that does not trade earns pnl 0, so an always-ABSTAIN model (or one that abstains only when
+masked) would otherwise get gap 0 and "no evidence", or even a false "suspected" (see Limits).
+Else "insufficient data" if pre or post has fewer than 20 decision dates. Else
 "memorisation suspected" iff lower CI bound of gap_pre > 0 AND lower CI bound of
 (gap_pre − gap_post) > 0. Otherwise "no evidence". Decision dates are sampled stratified, half
 before and half on/after the cutoff, when the data allows. hit_rate = hits / trades; a trade is
@@ -117,6 +121,11 @@ real model is known to do.
 - **Leak:** masked prompt containing a real ticker/date/price aborts the run before any API call.
 - **Unparseable or refused answer:** becomes ABSTAIN (pnl 0), counted per arm in the report;
   above 10% in either arm (whole run, pre or post) the verdict is "invalid run".
+- **Model that does not trade:** above 50% ABSTAIN (unparseable included) in either arm (whole
+  run, pre or post) the verdict is "invalid run" (too few trades).
+- **Non-verdict outcomes exit non-zero:** the CLI exits 3 for "invalid run" and 4 for
+  "insufficient data" (both still write the reports), so a script cannot mistake them for a
+  result. 2 stays for refused input, 1 for unexpected failures.
 - **Retried / rerun:** responses cached by sha256 of the full request (model, prompt, max_tokens,
   thinking, effort); a rerun with the same settings makes zero calls, and a changed setting is a
   miss, not a stale answer. Entries store their own key and are ignored if it does not match:
@@ -125,13 +134,22 @@ real model is known to do.
   cache directory controls the answers. The cache directory is created 0700; an existing one
   keeps its mode and is refused if group- or world-writable. A dry run does not create it.
 - **SDK retries:** set to 0. Each HTTP request is then a counted call against the budget; a
-  transient failure stops the run, and the rerun resumes from the cache.
+  transient failure (429, 529, 5xx, connection error) stops the run with exit 5 and a message
+  that a rerun resumes from the cache (no report is written for a partial run; the key is
+  redacted). Every answer is written to the cache as it arrives, so nothing needs flushing.
+- **Cache directory not ours / wrong endpoint:** an existing cache directory owned by another
+  uid is refused (e.g. one pre-created under /tmp at 0755). The cache key covers the API base URL
+  (`ANTHROPIC_BASE_URL` or the public default), and the client is built with that same URL, so
+  answers from a local stub server are never served on a real run.
 - **Partial run (crash mid-live-run):** completed calls are already cached; rerun resumes for free.
 - **Malicious CSV:** strict schema, ticker charset `[A-Z0-9.-]{1,10}` (blocks prompt-injection text
   in the ticker field), size limits, close as plain decimal text (no sign, spaces, exponent,
-  underscores, nan or inf), 0 < close ≤ 1e7 (masking multiplies by ≤ 6, so no overflow), dates on
-  or after 1900-01-01 (the backward date shift cannot underflow `date`), strictly increasing
-  (date, ticker), rectangular.
+  underscores, nan or inf), 0.01 ≤ close ≤ 1e7 (masking multiplies by ≤ 6, so no overflow; a
+  sub-cent close would render as "0.00" and abort as a false price leak), dates on or after
+  1900-01-01 (a sanity bound only), strictly increasing (date, ticker), rectangular. A panel whose
+  span would push the backward date shift below year 1 (e.g. a 9999-12-31 typo in a 1900 panel)
+  is refused by `Masker.fit` with a data error. Commit 6367253 claimed MIN_YEAR alone prevented
+  this underflow; it did not (a ~1,900-year span still overflowed).
 - **Overspend:** `--live` + key + `--yes` required; planned episodes > `--max-episodes` refuses; the
   provider also refuses calls beyond 2 × cap (defence in depth); estimate printed before any call.
 - **100× scale:** offline cost is linear in episodes (~µs each) and the bootstrap is a (B × dates)
@@ -159,6 +177,20 @@ real model is known to do.
 - **Mocks are not models.** The memorising mock's power of 1.0 shows the pipeline can detect a
   strong, exact memoriser; it says nothing about the power against real models, and power
   against partial memorisation has not been measured.
+- **Abstaining is a behaviour, and the gate is coarse.** The trade-count gate (50% ABSTAIN per
+  arm and part) catches a model that mostly does not trade; it does not catch a smaller change
+  in abstaining under masking. The report gives the abstain rate of each arm and the
+  masked − unmasked difference per part, and flags a difference above 10 percentage points. Such
+  a change moves pnl in proportion to |r| and can produce a gap alone: in
+  `tests/test_stats.py`, a masked arm that abstains on every pre-cutoff episode (unmasked always
+  LONG, r > 0) gave "memorisation suspected" before the gate existed. Why 50%: at that rate half
+  the episodes cannot express a direction, so "no evidence" would mostly describe non-trading.
+  Measured with the memorising mock (8 tickers × 60 dates, 300 seeds, both arms abstaining at
+  random on a fraction q of prompts): detected in 1.000 / 0.987 / 0.940 of seeds at q = 0 / 0.25 /
+  0.40; at q = 0.50, 0.950 of seeds were "invalid run" (the per-part rate exceeds 50% by sampling
+  noise) and at q ≥ 0.60 all were. A stricter limit (e.g. 25%) would reject cautious but usable
+  models; a looser one (e.g. 75%) would report verdicts where power is unknown. What would change
+  this: a measured power curve against a weak memoriser, which might justify a lower limit.
 - **Month-granular cutoff.** The training cutoff is month-granular ("Jun 2026"); we use 2026-06-01, so June episodes count
   as post-cutoff. Any June memory then shrinks gap_pre − gap_post, which makes the verdict more
   conservative, not less.
@@ -168,8 +200,9 @@ real model is known to do.
 Live, `claude-haiku-5-5` at $0.10 / $0.50 per MTok: one prompt with 20 closes is ~584 bytes;
 output is capped at 16 tokens. The estimator in `live.py` bounds input tokens by UTF-8 bytes
 (a byte-level BPE token covers at least one byte) plus an unverified 64-token allowance per
-request, output by `max_tokens`, and multiplies by (1 + max_retries) = 1. Its output: 1,000
-episodes × 2 arms = 2,000 calls ≤ $0.1463. Reruns cost $0 (cache). This is a bound, not a
+request, output by `max_tokens`, and multiplies by (1 + max_retries) = 1. Its printed output
+(dry run, synthetic panel, 10 tickers × 100 dates, cutoff 2025-01-02): 1,000 episodes × 2 arms =
+2,000 calls, at most $0.145478. (An earlier version of this section said $0.1463.) Reruns cost $0 (cache). This is a bound, not a
 measured bill; real usage is recorded in `report.json`.
 
 ## Increments

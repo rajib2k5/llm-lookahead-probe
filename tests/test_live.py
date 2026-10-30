@@ -11,9 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from llm_lookahead_probe.cli import main
+from llm_lookahead_probe.cli import EXIT_API_ERROR, EXIT_INSUFFICIENT_DATA, EXIT_INVALID_RUN, main
 from llm_lookahead_probe.data import synthetic_panel
 from llm_lookahead_probe.live import (
+    DEFAULT_BASE_URL,
     MAX_RETRIES,
     MODEL_TABLE,
     PER_REQUEST_OVERHEAD_TOKENS,
@@ -21,6 +22,7 @@ from llm_lookahead_probe.live import (
     ResponseCache,
     default_client_factory,
     estimate_cost,
+    resolve_base_url,
 )
 
 SECRET = "sk-ant-test-DO-NOT-PRINT-0123456789"
@@ -112,7 +114,8 @@ def test_cap_is_enforced_before_any_call(tmp_path, prices_csv, env_key, capsys):
 
 def test_yes_spends_records_usage_and_rerun_uses_cache(tmp_path, prices_csv, env_key, capsys):
     first = FakeClient()
-    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: first) == 0
+    # 4 decision dates: the verdict is "insufficient data", exit 4 (the spend path is what is tested).
+    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: first) == 4
     assert len(first.calls) == 24
     call = first.calls[0]
     assert call["model"] == "claude-haiku-5-5"
@@ -130,7 +133,7 @@ def test_yes_spends_records_usage_and_rerun_uses_cache(tmp_path, prices_csv, env
 
     second = FakeClient()
     capsys.readouterr()
-    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: second) == 0
+    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: second) == 4
     assert second.calls == []
     assert "0 uncached calls" in capsys.readouterr().out
     rep2 = json.loads((tmp_path / "out" / "report.json").read_text())
@@ -323,5 +326,145 @@ def test_estimate_is_printed_before_the_first_call(tmp_path, prices_csv, env_key
             return super().create(**kw)
 
     client = OrderChecking()
-    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: client) == 0
+    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: client) == 4
     assert client.seen_estimate_first is True
+
+
+# --- exit codes for non-verdict outcomes ------------------------------------------------------
+
+
+def test_always_abstain_model_is_an_invalid_run_with_exit_3_and_reports_written(
+    tmp_path, prices_csv, env_key, capsys
+):
+    client = FakeClient(answer="ABSTAIN")
+    rc = main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: client)
+    out = capsys.readouterr().out
+    assert rc == EXIT_INVALID_RUN == 3
+    rep = json.loads((tmp_path / "out" / "report.json").read_text())
+    assert rep["verdict"] == "invalid run"
+    assert "too few trades" in rep["verdict_reason"]
+    assert "Verdict: invalid run" in out
+    assert (tmp_path / "out" / "report.md").exists()
+
+
+def test_too_few_dates_is_insufficient_data_with_exit_4_and_reports_written(
+    tmp_path, prices_csv, env_key, capsys
+):
+    client = FakeClient(answer="LONG")
+    rc = main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: client)
+    assert rc == EXIT_INSUFFICIENT_DATA == 4
+    rep = json.loads((tmp_path / "out" / "report.json").read_text())
+    assert rep["verdict"] == "insufficient data"
+
+
+# --- API errors: no SDK retries, but a clear resumable failure --------------------------------
+
+
+class FailAfter(FakeClient):
+    """Answers `n_ok` requests, then raises `exc` on every later request."""
+
+    def __init__(self, n_ok, exc):
+        super().__init__("LONG")
+        self.n_ok, self.exc = n_ok, exc
+
+    def create(self, **kw):
+        if len(self.calls) >= self.n_ok:
+            raise self.exc
+        return super().create(**kw)
+
+
+def _sdk_errors():
+    anthropic = pytest.importorskip("anthropic")
+    httpx = pytest.importorskip("httpx2")  # the transport anthropic 2.3 uses
+    rq = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return {
+        "429": anthropic.RateLimitError(
+            f"rate limited for {SECRET}", response=httpx.Response(429, request=rq), body=None
+        ),
+        "529": anthropic.APIStatusError("overloaded", response=httpx.Response(529, request=rq), body=None),
+        "connection": anthropic.APIConnectionError(request=rq),
+    }
+
+
+@pytest.mark.parametrize("kind", ["429", "529", "connection"])
+def test_an_api_error_exits_5_with_a_resume_hint_and_no_key(tmp_path, prices_csv, env_key, capsys, kind):
+    client = FailAfter(5, _sdk_errors()[kind])
+    rc = main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: client)
+    out = capsys.readouterr()
+    assert rc == EXIT_API_ERROR == 5
+    assert "re-run" in out.err and "cache" in out.err
+    assert SECRET not in out.out + out.err
+    assert not (tmp_path / "out" / "report.json").exists()  # no report from a partial run
+
+
+def test_a_rerun_after_an_api_error_resends_only_the_unanswered_prompts(
+    tmp_path, prices_csv, env_key, capsys
+):
+    first = FailAfter(5, _sdk_errors()["429"])
+    assert main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: first) == 5
+    second = FakeClient("LONG")
+    main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: second)
+    assert len(first.calls) == 5
+    assert len(second.calls) == 24 - 5
+
+
+# --- cache ownership and endpoint -------------------------------------------------------------
+
+
+def test_cache_refuses_an_existing_directory_owned_by_another_user(tmp_path, monkeypatch):
+    # E.g. /tmp/x pre-created at 0755 by someone else: not writable by us, but they control it.
+    d = tmp_path / "theirs"
+    d.mkdir()
+    os.chmod(d, 0o755)
+    other = d.stat().st_uid + 1
+    monkeypatch.setattr(os, "getuid", lambda: other)
+    with pytest.raises(ValueError, match="owned by"):
+        ResponseCache(d)
+
+
+def test_cache_key_includes_the_api_endpoint(tmp_path):
+    stub = ResponseCache(tmp_path / "c", endpoint="http://127.0.0.1:8099")
+    stub.put(req(), VALUE)
+    assert stub.get(req()) is not None
+    assert ResponseCache(tmp_path / "c", endpoint=DEFAULT_BASE_URL).get(req()) is None
+
+
+def test_answers_from_a_stub_server_are_not_served_on_a_real_run(tmp_path, prices_csv, env_key, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:8099")
+    stub = FakeClient("LONG")
+    main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: stub)
+    assert len(stub.calls) == 24
+    monkeypatch.delenv("ANTHROPIC_BASE_URL")
+    real = FakeClient("LONG")
+    main(live_args(tmp_path, prices_csv[0], "--yes"), client_factory=lambda key: real)
+    assert len(real.calls) == 24
+
+
+@pytest.mark.parametrize(
+    "env, expected", [(None, "https://api.anthropic.com"), ("http://127.0.0.1:8099", None)]
+)
+def test_client_is_built_with_the_endpoint_the_cache_key_uses(monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", env)
+    seen = {}
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = lambda **kw: seen.update(kw) or object()
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    default_client_factory("k")
+    assert seen["base_url"] == resolve_base_url() == (expected or env)
+
+
+def test_estimate_wording_states_the_bound_and_its_overhead_assumption(tmp_path, prices_csv, env_key, capsys):
+    main(live_args(tmp_path, prices_csv[0]), client_factory=lambda key: FakeClient())
+    out = capsys.readouterr().out
+    assert "at most $" in out and "about $" not in out
+    assert f"{PER_REQUEST_OVERHEAD_TOKENS}-token per-request overhead" in out
+
+
+def test_dry_run_prints_the_dates_on_each_side_of_the_cutoff(tmp_path, prices_csv, env_key, capsys):
+    main(live_args(tmp_path, prices_csv[0]), client_factory=lambda key: FakeClient())
+    out = capsys.readouterr().out
+    assert "Planned decision dates: 2 before the cutoff 2024-03-01, 2 on or after" in out
+    assert "needs at least 20 on each side" in out

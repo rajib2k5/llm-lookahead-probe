@@ -1,7 +1,13 @@
 """Command line: `llm-lookahead-probe run --offline ...` or `run --live ...`.
 
-Exit codes: 0 success (including a live dry run without --yes), 1 runtime failure, 2 refused
-input (validation, cap, missing key, unsafe output path).
+Exit codes (also in `run --help` and the README):
+  0  a verdict was reached ("memorisation suspected" or "no evidence"), or a live dry run
+  1  unexpected runtime failure (message redacted)
+  2  refused input: validation, cap, missing key, unsafe output or cache path
+  3  "invalid run": too many unparseable or ABSTAIN answers (reports are still written)
+  4  "insufficient data": too few decision dates before or after the cutoff (reports written)
+  5  live: an API request failed (429, 529, 5xx, connection); no report. Answers received so far
+     are cached; re-running the same command resumes and does not pay for them again.
 
 Spending rules for live mode: nothing is sent unless --live, --yes and ANTHROPIC_API_KEY are all
 present; the planned episode count must not exceed --max-episodes; every masked prompt passes the
@@ -22,11 +28,14 @@ from .live import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL,
     MODEL_TABLE,
+    PER_REQUEST_OVERHEAD_TOKENS,
     ClaudeModel,
+    LiveAPIError,
     ResponseCache,
     build_request,
     default_client_factory,
     estimate_cost,
+    resolve_base_url,
 )
 from .masking import LeakError, Masker
 from .probe import (
@@ -38,11 +47,24 @@ from .probe import (
     sample_episodes,
 )
 from .report import build_report, write_reports
-from .stats import summarise
+from .stats import MIN_DATES_PER_PART, summarise
 
 OFFLINE_DEFAULTS = {"n_tickers": 20, "n_dates": 120}
 LIVE_DEFAULTS = {"n_tickers": 5, "n_dates": 10}
 DEFAULT_MAX_EPISODES = 50
+EXIT_OK, EXIT_FAILURE, EXIT_REFUSED = 0, 1, 2
+EXIT_INVALID_RUN = 3
+EXIT_INSUFFICIENT_DATA = 4
+EXIT_API_ERROR = 5
+VERDICT_EXIT = {"invalid run": EXIT_INVALID_RUN, "insufficient data": EXIT_INSUFFICIENT_DATA}
+EXIT_CODES_HELP = """exit codes:
+  0  verdict reached ("memorisation suspected" or "no evidence"), or live dry run
+  1  unexpected runtime failure
+  2  refused input (validation, --max-episodes cap, missing key, unsafe path)
+  3  verdict "invalid run" (too many unparseable or ABSTAIN answers); reports written
+  4  verdict "insufficient data" (too few dates before or after the cutoff); reports written
+  5  live API request failed (no retries); re-run the same command to resume from the cache
+"""
 
 
 def _iso_date(s: str) -> date:
@@ -63,9 +85,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="llm-lookahead-probe",
         description="Measure how much an LLM trading agent's backtest is inflated by memorised history.",
+        epilog=EXIT_CODES_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    r = sub.add_parser("run", help="run the masked vs unmasked probe")
+    r = sub.add_parser(
+        "run",
+        help="run the masked vs unmasked probe",
+        epilog=EXIT_CODES_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     mode = r.add_mutually_exclusive_group(required=True)
     mode.add_argument("--offline", action="store_true", help="synthetic data and a mock model")
     mode.add_argument("--live", action="store_true", help="real Claude calls (costs money; needs --yes)")
@@ -120,8 +149,15 @@ def print_headline(rep: dict, paths) -> None:
         extra = "" if scaled is None else f"; gap / mean|r| {scaled:+.4f}"
         print(f"  {label} ({part['n_dates']} dates): {_ci(part['gap'])}{extra}")
     print(f"  pre - post: {_ci(rep['diff_pre_minus_post'])}")
-    print(f"Unmasked: mean pnl {_pct(u['mean_pnl'])}, hit rate {hr(u)}, unparseable {u['n_unparseable']}")
-    print(f"Masked:   mean pnl {_pct(m['mean_pnl'])}, hit rate {hr(m)}, unparseable {m['n_unparseable']}")
+    ab = lambda a: "n/a" if a["abstain_rate"] is None else f"{a['abstain_rate']:.3f}"  # noqa: E731
+    for label, a in (("Unmasked:", u), ("Masked:  ", m)):
+        print(
+            f"{label} mean pnl {_pct(a['mean_pnl'])}, hit rate {hr(a)}, abstain rate {ab(a)}, "
+            f"unparseable {a['n_unparseable']}"
+        )
+    sh = rep.get("abstain_shift")
+    if sh and sh["flag"]:
+        print(f"Warning: abstain rate changes under masking: {sh['note']}")
     if "usage" in rep:
         us = rep["usage"]
         print(
@@ -146,7 +182,7 @@ def _run_offline(a) -> int:
     rep = run_offline(a.mock, cfg)
     paths = write_reports(rep, a.out)
     print_headline(rep, paths)
-    return 0
+    return VERDICT_EXIT.get(rep["verdict"], EXIT_OK)
 
 
 def _run_live(a, client_factory) -> int:
@@ -174,7 +210,8 @@ def _run_live(a, client_factory) -> int:
         return 2
     plans = plan_episodes(panel, episodes, Masker.fit(panel, a.seed), a.window)  # leak check
     # Read-only for the estimate: a dry run must not create the cache directory.
-    lookup = ResponseCache(a.cache_dir, create=False)
+    endpoint = resolve_base_url()
+    lookup = ResponseCache(a.cache_dir, create=False, endpoint=endpoint)
     prompts = [p for pl in plans for p in (pl.prompt_u, pl.prompt_m)]
     uncached = [p for p in prompts if lookup.get(build_request(info, p, DEFAULT_MAX_TOKENS)) is None]
     est = estimate_cost(uncached, info, DEFAULT_MAX_TOKENS)
@@ -182,7 +219,14 @@ def _run_live(a, client_factory) -> int:
         f"Estimated cost: {est.calls} uncached calls of {len(prompts)} planned "
         f"({len(episodes)} episodes x 2 arms), <= {est.input_tokens} input + "
         f"{est.output_tokens} output tokens at ${info.input_usd_per_mtok}/${info.output_usd_per_mtok} "
-        f"per MTok = about ${est.cost_usd:.6f} (upper bound) on {info.model_id}"
+        f"per MTok on {info.model_id}: at most ${est.cost_usd:.6f}. Upper bound, assuming the stated "
+        f"{PER_REQUEST_OVERHEAD_TOKENS}-token per-request overhead (an unmeasured allowance)."
+    )
+    n_pre = len({e.date for e in episodes if e.date < cutoff})
+    n_post = len({e.date for e in episodes if e.date >= cutoff})
+    print(
+        f"Planned decision dates: {n_pre} before the cutoff {cutoff}, {n_post} on or after "
+        f"(a verdict needs at least {MIN_DATES_PER_PART} on each side)"
     )
     if not a.yes:
         print("Dry run: no API calls made. Re-run with --yes to spend.")
@@ -191,9 +235,20 @@ def _run_live(a, client_factory) -> int:
     if not api_key:
         _err("live mode needs the ANTHROPIC_API_KEY environment variable")
         return 2
-    cache = ResponseCache(a.cache_dir)
+    cache = ResponseCache(a.cache_dir, endpoint=endpoint)
     model = ClaudeModel(info, cache, lambda: client_factory(api_key), max_calls=2 * a.max_episodes)
-    result = execute(plans, model)
+    try:
+        result = execute(plans, model)
+    except LiveAPIError as e:
+        _err(
+            _redact(
+                f"API request failed after {e.calls_made} successful calls in this run ({e}). "
+                f"SDK retries are off so the call budget stays exact. Every answer received so far "
+                f"is already saved in the cache {a.cache_dir}; re-run the same command to resume: "
+                "cached prompts are not sent again and cost nothing. No report was written."
+            )
+        )
+        return EXIT_API_ERROR
     summary = summarise(result.records, cutoff, a.bootstrap, 0.95, a.seed)
     config = {
         "seed": a.seed,
@@ -218,7 +273,7 @@ def _run_live(a, client_factory) -> int:
     )
     paths = write_reports(rep, a.out)
     print_headline(rep, paths)
-    return 0
+    return VERDICT_EXIT.get(rep["verdict"], EXIT_OK)
 
 
 def main(argv: list[str] | None = None, client_factory=None) -> int:

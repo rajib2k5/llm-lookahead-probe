@@ -22,15 +22,17 @@ import math
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, timedelta
 
 import numpy as np
 
-from .data import PricePanel
+from .data import PriceDataError, PricePanel
 from .pit import Bar, Observation
 from .prompt import format_price
 
 FACTOR_LOW, FACTOR_HIGH = 1.5, 6.0
+# Extra backward shift on top of the panel span, drawn in [0, MAX_EXTRA_SHIFT_WEEKS].
+MAX_EXTRA_SHIFT_WEEKS = 104
 
 
 class LeakError(AssertionError):
@@ -62,7 +64,16 @@ class Masker:
         log_f = rng.uniform(math.log(FACTOR_LOW), math.log(FACTOR_HIGH), size=n)
         factors = {t: float(math.exp(x)) for t, x in zip(tickers, log_f, strict=True)}
         span_weeks = (panel.dates[-1] - panel.dates[0]).days // 7 + 1
-        shift_weeks = -(span_weeks + 1 + int(rng.integers(0, 105)))
+        # Checked for the largest possible shift, so whether a panel is accepted does not depend
+        # on the seed. The earliest masked date is the first panel date plus the shift.
+        worst = span_weeks + 1 + MAX_EXTRA_SHIFT_WEEKS
+        if (panel.dates[0] - date.min).days < 7 * worst:
+            raise PriceDataError(
+                f"the panel spans {panel.dates[0]} to {panel.dates[-1]}; masking shifts dates back "
+                f"by more than that span, which would fall before year 1. Check the dates for a "
+                "typo (e.g. 9999-12-31) or use a shorter panel"
+            )
+        shift_weeks = -(span_weeks + 1 + int(rng.integers(0, MAX_EXTRA_SHIFT_WEEKS + 1)))
         return cls(pseudonyms=pseudonyms, factors=factors, shift_weeks=shift_weeks, seed=seed)
 
     def with_redrawn_factor(self, ticker: str, attempt: int) -> Masker:

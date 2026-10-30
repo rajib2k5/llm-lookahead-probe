@@ -55,3 +55,20 @@ def test_bad_cutoff_is_a_usage_error(tmp_path):
                 str(tmp_path),
             ]
         )
+
+
+def test_offline_insufficient_data_exits_4_and_still_writes_reports(tmp_path, capsys):
+    # A cutoff after the synthetic panel leaves no post-cutoff dates.
+    rc = main(["run", "--offline", "--mock", "honest", "--cutoff", "2030-01-01", "--out", str(tmp_path)])
+    assert rc == 4
+    assert json.loads((tmp_path / "report.json").read_text())["verdict"] == "insufficient data"
+    assert (tmp_path / "report.md").exists()
+
+
+def test_help_documents_the_exit_codes(capsys):
+    with pytest.raises(SystemExit):
+        main(["run", "--help"])
+    out = capsys.readouterr().out
+    for code in ("0 ", "1 ", "2 ", "3 ", "4 ", "5 "):
+        assert f"exit {code}" in out or f"  {code}" in out
+    assert "invalid run" in out and "insufficient data" in out

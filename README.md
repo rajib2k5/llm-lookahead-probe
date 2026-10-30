@@ -38,6 +38,8 @@ Gap (unmasked - masked, mean pnl/episode, 95% t-interval): +0.5737% [+0.4402%, +
   pre-cutoff  (60 dates): +1.0791% [+0.9371%, +1.2210%]; gap / mean|r| +0.7468
   post-cutoff (60 dates): +0.0683% [-0.0679%, +0.2044%]; gap / mean|r| +0.0453
   pre - post: +1.0108% [+0.8162%, +1.2055%]
+Unmasked: mean pnl +0.4841%, hit rate 0.675, abstain rate 0.020, unparseable 45
+Masked:   mean pnl -0.0895%, hit rate 0.480, abstain rate 0.019, unparseable 43
 ```
 
 Output of the second command (headline lines):
@@ -50,7 +52,11 @@ Gap (unmasked - masked, mean pnl/episode, 95% t-interval): +0.0839% [-0.0045%, +
   pre-cutoff  (60 dates): +0.0996% [-0.0173%, +0.2166%]; gap / mean|r| +0.0690
   post-cutoff (60 dates): +0.0683% [-0.0679%, +0.2044%]; gap / mean|r| +0.0453
   pre - post: +0.0314% [-0.1463%, +0.2091%]
+Unmasked: mean pnl -0.0056%, hit rate 0.497, abstain rate 0.020, unparseable 45
+Masked:   mean pnl -0.0895%, hit rate 0.480, abstain rate 0.019, unparseable 43
 ```
+
+Both commands exit with code 0, because each run reached a verdict.
 
 Each run writes `report.json` and `report.md` to the `--out` directory. Other options: `--seed`, `--n-tickers`, `--n-dates`, `--window`, `--cutoff`, `--bootstrap`.
 
@@ -76,9 +82,24 @@ Before any model call, a leak check looks at every masked prompt. The prompt mus
 
 **Verdict rule.** This is the text of `VERDICT_RULE` in `src/llm_lookahead_probe/stats.py`:
 
-> 'invalid run' if, in the whole run or in the pre-cutoff or post-cutoff part, either arm has more than 10% unparseable answers (refusals, empty or truncated replies count as ABSTAIN and would otherwise hide a broken run as a zero gap); else 'insufficient data' if the pre-cutoff or post-cutoff part has fewer than 20 decision dates; else 'memorisation suspected' if the lower CI bound of gap_pre > 0 AND the lower CI bound of (gap_pre - gap_post) > 0; otherwise 'no evidence'. gap = mean over episodes of (pnl_unmasked - pnl_masked). CIs are Student t intervals on the per-date mean differences with G - 1 df (G = decision dates); the pre - post CI is Welch's interval with Welch-Satterthwaite df. Every date must have the same number of episodes.
+> 'invalid run' if, in the whole run or in the pre-cutoff or post-cutoff part, either arm has more than 10% unparseable answers (refusals, empty or truncated replies count as ABSTAIN and would otherwise hide a broken run as a zero gap), or either arm has more than 50% ABSTAIN answers including unparseable ones (too few trades: a model that abstains has gap 0 by construction); else 'insufficient data' if the pre-cutoff or post-cutoff part has fewer than 20 decision dates; else 'memorisation suspected' if the lower CI bound of gap_pre > 0 AND the lower CI bound of (gap_pre - gap_post) > 0; otherwise 'no evidence'. gap = mean over episodes of (pnl_unmasked - pnl_masked). CIs are Student t intervals on the per-date mean differences with G - 1 df (G = decision dates); the pre - post CI is Welch's interval with Welch-Satterthwaite df. Every date must have the same number of episodes.
 
-**Invalid run.** The probe counts an unparseable answer as ABSTAIN (pnl 0). If every answer failed, the gap would be 0 with a CI of [0, 0], and the verdict would be "no evidence". The invalid-run rule stops this. The probe also reports the number of unparseable answers per arm.
+**Invalid run.** The probe counts an unparseable answer as ABSTAIN (pnl 0). If every answer failed, the gap would be 0 with a CI of [0, 0], and the verdict would be "no evidence". The invalid-run rule stops this. The same problem occurs when the model answers ABSTAIN on purpose. An arm that does not trade earns pnl 0, so the gap is 0 by construction. For this reason the run is also invalid when either arm answers ABSTAIN (unparseable answers included) on more than 50% of the episodes, in the whole run or in one part. The 50% limit and its measured effect are in [docs/DESIGN.md](docs/DESIGN.md) (Limits).
+
+**Abstain shift.** The report gives the abstain rate of each arm, and the masked minus unmasked difference for the whole run and each part. If a difference is more than 10 percentage points, the report and the command output show a warning. The model then behaves differently when masked, and this change alone can make a gap.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | The run reached a verdict ("memorisation suspected" or "no evidence"), or a live dry run finished. |
+| 1 | An unexpected runtime failure. The message has the API key removed. |
+| 2 | The probe refused the input: a validation error, the `--max-episodes` cap, a missing key, or an unsafe output or cache path. |
+| 3 | The verdict is "invalid run". The reports are written. |
+| 4 | The verdict is "insufficient data". The reports are written. |
+| 5 | Live mode: an API request failed (for example 429, 529, a 5xx error, or a connection error). No report is written. Run the same command again to continue from the cache. |
+
+`llm-lookahead-probe run --help` shows the same list.
 
 ## Live mode (Claude, costs money)
 
@@ -107,8 +128,9 @@ The CSV must follow these rules. The loader refuses any file that breaks one of 
 
 - The header is `date,ticker,close`.
 - Rows are sorted by (date, ticker), with no duplicates.
-- A close is a plain decimal (`12.34` or `12`). It has no sign, spaces, exponent, or underscores. It is more than 0 and not more than 10,000,000.
+- A close is a plain decimal (`12.34` or `12`). It has no sign, spaces, exponent, or underscores. It is at least 0.01 and not more than 10,000,000. (Prompts show prices to the cent, so a smaller close would show as 0.00.)
 - A date has the form `YYYY-MM-DD` and is on or after 1900-01-01.
+- The dates span less than about 1,900 years. Masking moves dates back by more than the span, and the result must stay after year 1. (A typo such as 9999-12-31 breaks this rule.)
 - Every ticker has every date. The panel is rectangular.
 - A ticker matches `[A-Z0-9][A-Z0-9.-]{0,9}`.
 - The file is not more than 50 MB, 2,000,000 rows, and 1,000 tickers.
@@ -119,27 +141,30 @@ The default model is `claude-haiku-5-5`. It costs $0.10 per MTok of input and $0
 
 ### Response cache
 
-The probe caches responses in `.cache/llm-lookahead-probe/`. The key is the sha256 of the full request (model, prompt, `max_tokens`, thinking and effort settings). A rerun with the same settings makes no call and costs nothing. A changed setting makes new calls.
+The probe caches responses in `.cache/llm-lookahead-probe/`. The key is the sha256 of the full request (model, prompt, `max_tokens`, thinking and effort settings) and the API base URL. A rerun with the same settings makes no call and costs nothing. A changed setting makes new calls.
 
-- The SDK retries are off (`max_retries=0`). Each HTTP request is a counted call.
-- If a call fails, the run stops. Run it again, and the finished calls come from the cache.
-- A new cache directory gets mode 0700. The probe refuses an existing directory that is group-writable or world-writable.
+- The SDK retries are off (`max_retries=0`). Each HTTP request is a counted call, so the call budget is exact.
+- If a request fails (rate limit, overload, server error, or connection error), the run stops with exit code 5. The message tells you that a rerun continues from the cache. Each answer goes into the cache when it arrives, so a rerun does not send or pay for the prompts that already have an answer.
+- The cache key also contains the API base URL (`ANTHROPIC_BASE_URL`, or `https://api.anthropic.com` if it is not set). The probe gives the same URL to the SDK client. Thus answers from a local stub server are not used in a run against the real API.
+- A new cache directory gets mode 0700. The probe refuses an existing directory that is group-writable or world-writable, or that another user owns.
 - The cache is not tamper-proof. Its stored key detects a copied or corrupt entry. It does not detect an edited entry. Anyone who can write to the cache directory controls the answers that the probe scores.
 
 ### Cost per run
 
 Each episode makes 2 calls. The estimator counts at most one input token per UTF-8 byte. It adds 64 tokens per request for message framing, and the full 16-token output cap. Real prompts use about one token per 3 characters, so the bound is probably loose by 2 to 3 times. The 64-token overhead is an assumption.
 
-The table shows the output of the dry run on a synthetic panel with a 20-close window. Your numbers change a little with your ticker names and price format.
+The table shows the output of the dry run. The input was the seeded synthetic panel (20 tickers, 2024-01-02 to 2025-12-29) as a CSV, with `--cutoff 2025-01-02`, the default 20-close window, and no API key. The "Dates" column is the "Planned decision dates" line that the dry run prints. Your numbers change a little with your ticker names and price format.
 
-| Episodes | Calls | Input tokens (bound) | Output tokens (bound) | Estimated upper bound |
-|---|---|---|---|---|
-| 50 (default cap, 5 tickers x 10 dates) | 100 | 65,360 | 1,600 | $0.0073 |
-| 200 (5 tickers x 40 dates) | 400 | 259,178 | 6,400 | $0.0291 |
-| 1,000 (10 tickers x 100 dates) | 2,000 | 1,294,783 | 32,000 | $0.1455 |
-| 2,400 (20 tickers x 120 dates) | 4,800 | 3,110,506 | 76,800 | $0.3495 |
+| Episodes | Dates before / after cutoff | Calls | Input tokens (bound) | Output tokens (bound) | Upper bound (printed) |
+|---|---|---|---|---|---|
+| 50 (default cap, 5 tickers x 10 dates) | 5 / 5: too few for a verdict | 100 | 65,360 | 1,600 | $0.007336 |
+| 200 (5 tickers x 40 dates) | 20 / 20: the minimum for a verdict | 400 | 259,178 | 6,400 | $0.029118 |
+| 1,000 (10 tickers x 100 dates) | 50 / 50 | 2,000 | 1,294,783 | 32,000 | $0.145478 |
+| 2,400 (20 tickers x 120 dates) | 60 / 60 | 4,800 | 3,110,506 | 76,800 | $0.349451 |
 
-The default live setting (5 tickers x 10 dates) gives only 5 dates in each part. Its verdict is always "insufficient data". For a verdict, use at least 20 dates on each side of the cutoff. Raise `--max-episodes` to match.
+Each bound assumes the stated 64-token overhead per request. The command prints the bound as "at most $X" with this caveat.
+
+The default live setting (5 tickers x 10 dates) gives only 5 dates in each part. Its verdict is always "insufficient data" (exit code 4). For a verdict, use at least 20 dates on each side of the cutoff, and raise `--max-episodes` to match. If the cutoff is after the last date of your CSV, all dates are before the cutoff, and the verdict is also "insufficient data". The dry run prints the number of dates on each side, so you can check this before you spend.
 
 ## Limits
 
@@ -158,7 +183,7 @@ Version 0.1 supports only Claude, only `claude-haiku-5-5`, only a price path in 
 
 ## Validation
 
-`uv run pytest -q` printed `147 passed in 20.76s` in this checkout.
+`uv run pytest -q` printed `175 passed in 20.18s` in this checkout.
 
 The calibration test (`tests/test_calibration.py`) runs the full pipeline on the honest and memorising mocks. The panel has 8 tickers and 60 dates. The test printed these numbers:
 
