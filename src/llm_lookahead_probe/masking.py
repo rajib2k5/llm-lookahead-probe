@@ -17,6 +17,7 @@ Design choices (see docs/DESIGN.md):
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import re
 from collections.abc import Iterable
@@ -36,11 +37,19 @@ class LeakError(AssertionError):
     """A masked prompt contains a real ticker, real date or real price string."""
 
 
+class PriceLeakError(LeakError):
+    """A masked price token equals a real price of the same episode. On a volatile, low-priced
+    series this happens by coincidence (cents values collide), not because masking failed, so the
+    caller may redraw that ticker's factor and re-check; it never skips the check."""
+
+
 @dataclass(frozen=True)
 class Masker:
     pseudonyms: dict[str, str]
     factors: dict[str, float]
     shift_weeks: int
+    # Seed used by `fit`. A Masker built by hand has none and its factors are never redrawn.
+    seed: int | None = None
 
     @classmethod
     def fit(cls, panel: PricePanel, seed: int) -> Masker:
@@ -54,7 +63,18 @@ class Masker:
         factors = {t: float(math.exp(x)) for t, x in zip(tickers, log_f, strict=True)}
         span_weeks = (panel.dates[-1] - panel.dates[0]).days // 7 + 1
         shift_weeks = -(span_weeks + 1 + int(rng.integers(0, 105)))
-        return cls(pseudonyms=pseudonyms, factors=factors, shift_weeks=shift_weeks)
+        return cls(pseudonyms=pseudonyms, factors=factors, shift_weeks=shift_weeks, seed=seed)
+
+    def with_redrawn_factor(self, ticker: str, attempt: int) -> Masker:
+        """A copy whose factor for `ticker` is a fresh log-uniform draw in [FACTOR_LOW, FACTOR_HIGH],
+        derived only from (seed, ticker position in sorted order, attempt): deterministic, and
+        independent of the order in which tickers are planned."""
+        if self.seed is None:
+            raise ValueError("this Masker has no seed; its factors cannot be redrawn")
+        pos = sorted(self.factors).index(ticker)
+        rng = np.random.default_rng(np.random.SeedSequence([self.seed, 0x3A5C, 0xFAC7, pos, attempt]))
+        f = float(math.exp(rng.uniform(math.log(FACTOR_LOW), math.log(FACTOR_HIGH))))
+        return dataclasses.replace(self, factors={**self.factors, ticker: f})
 
     def pseudonym(self, ticker: str) -> str:
         return self.pseudonyms[ticker]
@@ -97,5 +117,5 @@ class LeakChecker:
         prices = {format_price(p) for p in real_prices}
         for tok in _NUMBER_TOKEN.findall(masked_prompt):
             if tok in prices:
-                raise LeakError(f"masked prompt contains real price {tok}")
+                raise PriceLeakError(f"masked prompt contains real price {tok}")
         self.checked += 1

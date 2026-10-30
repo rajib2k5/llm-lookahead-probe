@@ -13,18 +13,23 @@ Model facts and where they come from (checked 2026-10-29):
   above. The claude-api skill states a cutoff only for Claude Opus 5.5 (shared/model-migration.md:
   "Knowledge cutoff June 2026"), so the Haiku value comes from the live page. We map "Jun 2026" to
   2026-06-01, which counts June as post-cutoff (the conservative side, see docs/DESIGN.md).
-- Request shape: claude-api skill, Thinking & Effort table and shared/models.md: on Claude Haiku 5.5
-  non-default `temperature`/`top_p`/`top_k` return a 400, so none is sent; adaptive thinking is on
-  by default and `thinking: {type: "disabled"}` is accepted at effort `high` or below (the default
-  effort is `medium`). We disable thinking so a 16-token cap holds the one-word answer instead of
-  being consumed by thinking.
+- Request shape: claude-api skill, shared/models.md (Claude Haiku 5.5 entry): non-default
+  `temperature`/`top_p`/`top_k` return a 400, so none is sent; adaptive thinking is on by default
+  and `thinking: {type: "disabled"}` is accepted only at effort `high` or below; `effort` runs from
+  `low` to `max` with default `medium`. We disable thinking so a 16-token cap holds the one-word
+  answer instead of being consumed by thinking.
+- Effort is pinned to `medium` with `output_config={"effort": "medium"}` rather than left to the
+  server default, so a future change of the default to `xhigh`/`max` cannot turn every call into
+  a 400. Sources: the parameter shape is python/claude-api/README.md (Extended Thinking example,
+  `output_config={"effort": ...}`); shared/prompt-caching.md states that setting a model's default
+  effort explicitly is equivalent to omitting it. anthropic 2.3.0's `Messages.create` accepts
+  `output_config` (checked with inspect.signature). Not checked against the live API.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import stat
 from collections import Counter
@@ -53,15 +58,26 @@ MODEL_TABLE: dict[str, ModelInfo] = {
         output_usd_per_mtok=0.50,  # source: same
         training_cutoff=date(2026, 6, 1),  # "Jun 2026", Models Overview page (see module doc)
         cutoff_text="Jun 2026 (platform.claude.com Models Overview, training data cutoff)",
-        request_extra={"thinking": {"type": "disabled"}},  # source: claude-api skill thinking table
+        # source: claude-api skill shared/models.md (Haiku 5.5) and python README (output_config)
+        request_extra={"thinking": {"type": "disabled"}, "output_config": {"effort": "medium"}},
     ),
 }
 DEFAULT_MODEL = "claude-haiku-5-5"
 DEFAULT_MAX_TOKENS = 16
 
-# Conservative token estimate: ~2 characters per token (real prompts of dates and prices tokenise
-# at roughly 3 characters per token or more), so the printed estimate is an upper bound.
-CHARS_PER_TOKEN_ESTIMATE = 2.0
+# Cost estimate, worst case per request (see estimate_cost for the argument):
+#   input tokens  <= UTF-8 bytes of the prompt + PER_REQUEST_OVERHEAD_TOKENS
+#   output tokens <= max_tokens
+# PER_REQUEST_OVERHEAD_TOKENS is an allowance for the tokens the API adds around one user message
+# (role and turn markers). It is an assumption, NOT a measured value: no live call has been made.
+# report.json records the real input_tokens the API returns, which is the check on this number.
+PER_REQUEST_OVERHEAD_TOKENS = 64
+
+# SDK retries (connection errors, 408/409/429/5xx) are HTTP requests the call budget cannot see,
+# and a retried request may be billed. We set them to 0: every request is a counted call, and a
+# run that fails mid-way is resumed for free from the cache. estimate_cost multiplies by
+# (1 + max_retries) so the estimate stays an upper bound if this is ever raised.
+MAX_RETRIES = 0
 
 
 @dataclass(frozen=True)
@@ -72,38 +88,92 @@ class CostEstimate:
     cost_usd: float
 
 
-def estimate_cost(prompts: Iterable[str], info: ModelInfo, max_tokens: int) -> CostEstimate:
+def estimate_cost(
+    prompts: Iterable[str], info: ModelInfo, max_tokens: int, max_retries: int = MAX_RETRIES
+) -> CostEstimate:
+    """Worst-case cost of sending `prompts`, one request each.
+
+    Argument for the bound. Input: Claude's tokenizer is a byte-level BPE, so every token covers
+    at least one byte of the text and a prompt of n UTF-8 bytes is at most n tokens (for the ASCII
+    prompts this probe renders, bytes = characters; real prompts of dates and prices tokenise at
+    about 3 characters per token, so the bound is loose by roughly 3x). To that we add
+    PER_REQUEST_OVERHEAD_TOKENS for message framing, an unverified allowance. Output: the API
+    stops generating at `max_tokens`, and thinking is disabled, so output tokens <= max_tokens.
+    Retries: each request may be sent up to 1 + max_retries times, and we assume every attempt is
+    billed in full.
+    """
     prompts = list(prompts)
-    tin = sum(math.ceil(len(p) / CHARS_PER_TOKEN_ESTIMATE) for p in prompts)
-    tout = max_tokens * len(prompts)
+    attempts = 1 + max_retries
+    tin = attempts * sum(len(p.encode("utf-8")) + PER_REQUEST_OVERHEAD_TOKENS for p in prompts)
+    tout = attempts * max_tokens * len(prompts)
     cost = (tin * info.input_usd_per_mtok + tout * info.output_usd_per_mtok) / 1e6
     return CostEstimate(len(prompts), tin, tout, cost)
 
 
-class ResponseCache:
-    """One JSON file per (model, prompt), named by sha256 of both. Directory 0700, files 0600.
+def build_request(info: ModelInfo, prompt: str, max_tokens: int) -> dict:
+    """The exact keyword arguments sent to `messages.create`. The cache key is a hash of this whole
+    dict, so a change to any request parameter (model, max_tokens, thinking, effort, prompt) is a
+    cache miss rather than a stale answer produced under another configuration."""
+    return {
+        "model": info.model_id,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+        **info.request_extra,
+    }
 
-    Each entry stores its own key and model; an entry whose stored key does not match the file
-    being read (copied, swapped or corrupted) is treated as a miss, never served. Writes are
-    atomic (temp file + rename) so a crash cannot leave a half-written entry.
+
+class ResponseCache:
+    """One JSON file per request, named by sha256 of the canonical JSON of the full request.
+
+    What the stored key protects against: an entry file that was copied or renamed to another
+    request's name, swapped, truncated or corrupted is treated as a miss, never served. What it
+    does NOT protect against: deliberate tampering. The key is a plain hash of the request, not a
+    MAC, so anyone who can write to the cache directory can edit an entry's `text` and it will be
+    served (tests/test_live.py pins this). Whoever controls the cache directory controls the
+    answers the probe scores; keep it private.
+
+    Directory handling: a directory this class creates gets mode 0700. An existing directory is
+    used as it is (its mode is never changed, so `--cache-dir ~` cannot alter the home directory),
+    but one that is group- or world-writable is refused, because another user could plant
+    answers in it. With `create=False` a missing directory is not created: every lookup misses and
+    `put` refuses (used by the live dry run, which must not touch the disk).
+
+    Files are 0600 and written atomically (temp file + rename), so a crash cannot leave a
+    half-written entry.
     """
 
-    def __init__(self, root: str | os.PathLike[str]) -> None:
+    def __init__(self, root: str | os.PathLike[str], *, create: bool = True) -> None:
         self.root = Path(root)
         if self.root.is_symlink():
             raise ValueError(f"refusing to use symlinked cache directory {self.root}")
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
+        self._exists = self.root.is_dir()
+        if self._exists:
+            mode = stat.S_IMODE(self.root.stat().st_mode)
+            if mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise ValueError(
+                    f"refusing to use cache directory {self.root}: it is group- or world-writable "
+                    f"(mode {mode:04o}), so another user could plant answers; use a private directory"
+                )
+        elif self.root.exists():
+            raise ValueError(f"cache path {self.root} exists and is not a directory")
+        elif create:
+            self.root.parent.mkdir(parents=True, exist_ok=True)
+            self.root.mkdir(mode=0o700)
+            os.chmod(self.root, 0o700)  # mkdir's mode is filtered by the umask; we created it
+            self._exists = True
 
     @staticmethod
-    def key(model: str, prompt: str) -> str:
-        return hashlib.sha256(json.dumps([model, prompt]).encode()).hexdigest()
+    def key(request: dict) -> str:
+        canonical = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
-    def path_for(self, model: str, prompt: str) -> Path:
-        return self.root / f"{self.key(model, prompt)}.json"
+    def path_for(self, request: dict) -> Path:
+        return self.root / f"{self.key(request)}.json"
 
-    def get(self, model: str, prompt: str) -> dict | None:
-        p = self.path_for(model, prompt)
+    def get(self, request: dict) -> dict | None:
+        if not self._exists:
+            return None
+        p = self.path_for(request)
         try:
             if p.is_symlink() or not p.is_file():
                 return None
@@ -112,8 +182,8 @@ class ResponseCache:
             return None
         ok = (
             isinstance(entry, dict)
-            and entry.get("key") == self.key(model, prompt)
-            and entry.get("model") == model
+            and entry.get("key") == self.key(request)
+            and entry.get("model") == request.get("model")
             and isinstance(entry.get("text"), str)
             and isinstance(entry.get("input_tokens"), int)
             and isinstance(entry.get("output_tokens"), int)
@@ -121,9 +191,11 @@ class ResponseCache:
         )
         return entry if ok else None
 
-    def put(self, model: str, prompt: str, value: dict) -> None:
-        entry = {"key": self.key(model, prompt), "model": model, **value}
-        final = self.path_for(model, prompt)
+    def put(self, request: dict, value: dict) -> None:
+        if not self._exists:
+            raise RuntimeError(f"cache directory {self.root} was opened read-only and does not exist")
+        entry = {"key": self.key(request), "model": request.get("model"), **value}
+        final = self.path_for(request)
         tmp = final.with_suffix(f".tmp{os.getpid()}")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -150,7 +222,8 @@ class ClaudeModel:
         self.stop_reasons: Counter[str] = Counter()
 
     def complete(self, prompt: str) -> str:
-        hit = self.cache.get(self.info.model_id, prompt)
+        request = build_request(self.info, prompt, self.max_tokens)
+        hit = self.cache.get(request)
         if hit is not None:
             self.cache_hits += 1
             return hit["text"]
@@ -159,12 +232,7 @@ class ClaudeModel:
         if self._client is None:
             self._client = self._get_client()
         self.calls += 1
-        resp = self._client.messages.create(
-            model=self.info.model_id,
-            max_tokens=self.max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-            **self.info.request_extra,
-        )
+        resp = self._client.messages.create(**request)
         # A refusal or an empty reply yields "", which the agent counts as unparseable (ABSTAIN).
         text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
         tin, tout = int(resp.usage.input_tokens), int(resp.usage.output_tokens)
@@ -172,8 +240,7 @@ class ClaudeModel:
         self.output_tokens += tout
         self.stop_reasons[str(resp.stop_reason)] += 1
         self.cache.put(
-            self.info.model_id,
-            prompt,
+            request,
             {
                 "text": text,
                 "input_tokens": tin,
@@ -210,4 +277,4 @@ def default_client_factory(api_key: str) -> Any:
         raise RuntimeError(
             "live mode needs the 'live' extra: pip install 'llm-lookahead-probe[live]'"
         ) from exc
-    return anthropic.Anthropic(api_key=api_key, max_retries=2, timeout=60.0)
+    return anthropic.Anthropic(api_key=api_key, max_retries=MAX_RETRIES, timeout=60.0)

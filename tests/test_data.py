@@ -3,7 +3,7 @@ from datetime import date
 import numpy as np
 import pytest
 
-from llm_lookahead_probe.data import PriceDataError, PricePanel, load_prices_csv, synthetic_panel
+from llm_lookahead_probe.data import MAX_CLOSE, PriceDataError, PricePanel, load_prices_csv, synthetic_panel
 
 
 def write(tmp_path, text, name="p.csv"):
@@ -63,6 +63,15 @@ def test_load_valid_csv(tmp_path):
             "rectangular",
         ),
         ("date,ticker,close\n", "no rows"),
+        ("date,ticker,close\n2024-01-02,AAA,1_000\n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA, 5 \n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA,+6\n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA,1e3\n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA,.5\n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA,5.\n", "decimal"),
+        ("date,ticker,close\n2024-01-02,AAA,10000000.01\n", "maximum"),
+        ("date,ticker,close\n0001-01-03,AAA,1\n", "1900"),
+        ("date,ticker,close\n1899-12-29,AAA,1\n", "1900"),
     ],
 )
 def test_load_rejects_bad_csv(tmp_path, body, fragment):
@@ -92,3 +101,21 @@ def test_panel_rejects_unsorted_dates():
             tickers=("AAA",),
             closes=np.array([[1.0], [2.0]]),
         )
+
+
+def test_largest_allowed_price_and_earliest_allowed_date_load(tmp_path):
+    p = load_prices_csv(write(tmp_path, "date,ticker,close\n1900-01-01,AAA,10000000\n"))
+    assert p.closes[0, 0] == MAX_CLOSE == 1e7
+    assert p.dates == (date(1900, 1, 1),)
+
+
+def test_a_panel_starting_in_1900_masks_without_overflow(tmp_path):
+    from llm_lookahead_probe.masking import Masker
+    from llm_lookahead_probe.probe import plan_episodes, sample_episodes
+
+    dates = synthetic_panel(0, 1, 30, start=date(1900, 1, 1)).dates
+    lines = ["date,ticker,close"] + [f"{d.isoformat()},AAA,{10 + k * 0.37:.2f}" for k, d in enumerate(dates)]
+    panel = load_prices_csv(write(tmp_path, "\n".join(lines) + "\n"))
+    eps = sample_episodes(panel, 1, 4, 10, None, seed=0)
+    plans = plan_episodes(panel, eps, Masker.fit(panel, seed=0), 10)
+    assert all(pl.obs_m.as_of.year < 1900 for pl in plans)

@@ -24,6 +24,7 @@ from .live import (
     MODEL_TABLE,
     ClaudeModel,
     ResponseCache,
+    build_request,
     default_client_factory,
     estimate_cost,
 )
@@ -112,9 +113,12 @@ def print_headline(rep: dict, paths) -> None:
     print(f"Verdict: {rep['verdict']}")
     print(f"  {rep['verdict_reason']}")
     print(f"Episodes: {rep['n_episodes']} on {rep['n_dates']} dates; cutoff {rep['cutoff']}")
-    print(f"Gap (unmasked - masked, mean pnl/episode, 95% CI): {_ci(rep['gap'])}")
-    print(f"  pre-cutoff  ({rep['pre']['n_dates']} dates): {_ci(rep['pre']['gap'])}")
-    print(f"  post-cutoff ({rep['post']['n_dates']} dates): {_ci(rep['post']['gap'])}")
+    print(f"Gap (unmasked - masked, mean pnl/episode, 95% t-interval): {_ci(rep['gap'])}")
+    for name, label in (("pre", "pre-cutoff "), ("post", "post-cutoff")):
+        part = rep[name]
+        scaled = part.get("gap_per_mean_abs_r")
+        extra = "" if scaled is None else f"; gap / mean|r| {scaled:+.4f}"
+        print(f"  {label} ({part['n_dates']} dates): {_ci(part['gap'])}{extra}")
     print(f"  pre - post: {_ci(rep['diff_pre_minus_post'])}")
     print(f"Unmasked: mean pnl {_pct(u['mean_pnl'])}, hit rate {hr(u)}, unparseable {u['n_unparseable']}")
     print(f"Masked:   mean pnl {_pct(m['mean_pnl'])}, hit rate {hr(m)}, unparseable {m['n_unparseable']}")
@@ -169,9 +173,10 @@ def _run_live(a, client_factory) -> int:
         )
         return 2
     plans = plan_episodes(panel, episodes, Masker.fit(panel, a.seed), a.window)  # leak check
-    cache = ResponseCache(a.cache_dir)
+    # Read-only for the estimate: a dry run must not create the cache directory.
+    lookup = ResponseCache(a.cache_dir, create=False)
     prompts = [p for pl in plans for p in (pl.prompt_u, pl.prompt_m)]
-    uncached = [p for p in prompts if cache.get(info.model_id, p) is None]
+    uncached = [p for p in prompts if lookup.get(build_request(info, p, DEFAULT_MAX_TOKENS)) is None]
     est = estimate_cost(uncached, info, DEFAULT_MAX_TOKENS)
     print(
         f"Estimated cost: {est.calls} uncached calls of {len(prompts)} planned "
@@ -186,6 +191,7 @@ def _run_live(a, client_factory) -> int:
     if not api_key:
         _err("live mode needs the ANTHROPIC_API_KEY environment variable")
         return 2
+    cache = ResponseCache(a.cache_dir)
     model = ClaudeModel(info, cache, lambda: client_factory(api_key), max_calls=2 * a.max_episodes)
     result = execute(plans, model)
     summary = summarise(result.records, cutoff, a.bootstrap, 0.95, a.seed)

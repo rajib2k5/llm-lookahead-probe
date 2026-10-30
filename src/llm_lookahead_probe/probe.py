@@ -14,7 +14,7 @@ import numpy as np
 
 from .agent import DailyLongShortAgent, Model
 from .data import PricePanel, synthetic_panel
-from .masking import LeakChecker, Masker
+from .masking import LeakChecker, Masker, PriceLeakError
 from .mocks import HonestMock, MemorisingMock
 from .pit import Observation, build_observation
 from .prompt import render_prompt
@@ -24,6 +24,12 @@ from .stats import EpisodeResult, summarise
 # Synthetic panel: 520 business days from 2024-01-02 (to 2025-12-30); the offline "training
 # cutoff" sits near the middle so both parts have plenty of dates.
 OFFLINE_CUTOFF = date(2025, 1, 2)
+
+# Bounded, seeded retries of a ticker's price factor after a coincidental price collision. On the
+# most volatile series we tried (25% daily volatility, ~$2 prices) about half of all draws collide;
+# 0.5 ** 21 is about 5e-7, so 20 redraws make an abort on such a series very unlikely while keeping
+# the check fail-closed.
+MAX_FACTOR_REDRAWS = 20
 
 
 @dataclass(frozen=True)
@@ -98,18 +104,47 @@ def sample_episodes(
 def plan_episodes(
     panel: PricePanel, episodes: list[Episode], masker: Masker, window: int
 ) -> list[PlannedEpisode]:
-    """Render both prompts for every episode and leak-check every masked prompt (raises LeakError)."""
+    """Render both prompts for every episode and leak-check every masked prompt (raises LeakError).
+
+    A price collision (PriceLeakError) is a coincidence on volatile low-priced series: some masked
+    cents value equals a real price of the same episode. The ticker's factor is then redrawn
+    deterministically (Masker.with_redrawn_factor) and ALL of that ticker's episodes are planned
+    again with the new factor, at most MAX_FACTOR_REDRAWS times. The check is never skipped: if
+    every draw collides, the last PriceLeakError is raised. Ticker or date leaks are never retried.
+    A Masker without a seed (built by hand) is not redrawn.
+    """
     checker = LeakChecker(panel)
-    plans = []
-    for e in episodes:
-        obs_u = build_observation(panel, e.ticker, e.date, window)
-        obs_m = masker.mask(obs_u)
-        prompt_m = render_prompt(obs_m)
-        i = panel.date_index(e.date)
-        next_close = float(panel.closes[i + 1, panel.ticker_index(e.ticker)])
-        checker.check(prompt_m, real_prices=[b.close for b in obs_u.bars] + [next_close])
-        plans.append(PlannedEpisode(e, obs_u, obs_m, render_prompt(obs_u), prompt_m))
-    return plans
+    by_ticker: dict[str, list[int]] = {}
+    for k, e in enumerate(episodes):
+        by_ticker.setdefault(e.ticker, []).append(k)
+    plans: list[PlannedEpisode | None] = [None] * len(episodes)
+    for ticker, idx in by_ticker.items():
+        attempt = 0
+        while True:
+            try:
+                planned = [_plan_one(panel, episodes[k], masker, window, checker) for k in idx]
+                break
+            except PriceLeakError:
+                if masker.seed is None or attempt >= MAX_FACTOR_REDRAWS:
+                    raise
+                attempt += 1
+                masker = masker.with_redrawn_factor(ticker, attempt)
+        for k, pl in zip(idx, planned, strict=True):
+            plans[k] = pl
+    return [p for p in plans if p is not None]
+
+
+def _plan_one(
+    panel: PricePanel, e: Episode, masker: Masker, window: int, checker: LeakChecker
+) -> PlannedEpisode:
+    obs_u = build_observation(panel, e.ticker, e.date, window)
+    obs_m = masker.mask(obs_u)
+    prompt_m = render_prompt(obs_m)
+    i = panel.date_index(e.date)
+    # The next close is the price the decision is scored against; it must not appear either.
+    next_close = float(panel.closes[i + 1, panel.ticker_index(e.ticker)])
+    checker.check(prompt_m, real_prices=[b.close for b in obs_u.bars] + [next_close])
+    return PlannedEpisode(e, obs_u, obs_m, render_prompt(obs_u), prompt_m)
 
 
 def execute(plans: list[PlannedEpisode], model: Model) -> RunResult:

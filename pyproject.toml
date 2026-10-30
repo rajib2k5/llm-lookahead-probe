@@ -30,6 +30,8 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+# Validation probes are kept byte-for-byte as they were run (docs/validation/report.md); not linted.
+extend-exclude = ["docs/validation/probes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]

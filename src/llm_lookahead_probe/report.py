@@ -37,6 +37,22 @@ def build_report(
     return rep
 
 
+# Stated in every report so a reader of one file sees them. docs/DESIGN.md has the longer version.
+LIMITS = (
+    "pre - post removes only a masking effect that is constant in pnl. An effect constant in "
+    "behaviour (e.g. abstaining more when masked) scales with each period's mean |r|; compare the "
+    "'gap / mean abs r' column of the two periods before reading pre - post as memory.",
+    "Masking keeps the exact return path and, under a whole-week date shift, the holiday-gap "
+    "pattern. A model could recognise an episode from either, which biases toward under-detection.",
+    "Masked dates fall in the real past (shifted back), not in a fictional calendar.",
+    "The panel must be rectangular (every ticker on every date), i.e. a survivor-only universe.",
+    "Decisions are made and scored at the observed close of the decision date.",
+    "The leak check covers only the renderer's canonical forms (whole-token ticker, YYYY-MM-DD, "
+    "d.dd); tests pin the prompt to that grammar.",
+    "Offline mock results (e.g. power 1.0 for the memorising mock) say nothing about real models.",
+)
+
+
 def _f(x, pct=False) -> str:
     if x is None:
         return "n/a"
@@ -50,7 +66,7 @@ def _ci(c: dict | None) -> str:
 
 
 def render_markdown(rep: dict) -> str:
-    lvl = int(round(rep["bootstrap"]["level"] * 100))
+    lvl = int(round(rep["interval"]["level"] * 100))
     lines = [
         "# llm-lookahead-probe report",
         "",
@@ -68,14 +84,17 @@ def render_markdown(rep: dict) -> str:
         "",
         f"## Gap (unmasked minus masked mean pnl per episode, {lvl}% CI)",
         "",
-        "| Part | Dates | Episodes | Gap [CI] |",
-        "|---|---|---|---|",
-        f"| All | {rep['n_dates']} | {rep['n_episodes']} | {_ci(rep['gap'])} |",
+        "| Part | Dates | Episodes | Gap [CI] | Mean abs r | Gap / mean abs r |",
+        "|---|---|---|---|---|---|",
+        f"| All | {rep['n_dates']} | {rep['n_episodes']} | {_ci(rep['gap'])} "
+        f"| {_f(rep.get('mean_abs_r'), True)} | {_f(rep.get('gap_per_mean_abs_r'))} |",
         f"| Before cutoff | {rep['pre']['n_dates']} | {rep['pre']['n_episodes']} "
-        f"| {_ci(rep['pre']['gap'])} |",
+        f"| {_ci(rep['pre']['gap'])} | {_f(rep['pre'].get('mean_abs_r'), True)} "
+        f"| {_f(rep['pre'].get('gap_per_mean_abs_r'))} |",
         f"| On/after cutoff | {rep['post']['n_dates']} | {rep['post']['n_episodes']} "
-        f"| {_ci(rep['post']['gap'])} |",
-        f"| Pre minus post | | | {_ci(rep['diff_pre_minus_post'])} |",
+        f"| {_ci(rep['post']['gap'])} | {_f(rep['post'].get('mean_abs_r'), True)} "
+        f"| {_f(rep['post'].get('gap_per_mean_abs_r'))} |",
+        f"| Pre minus post | | | {_ci(rep['diff_pre_minus_post'])} | | |",
         "",
         "## Arms",
         "",
@@ -88,13 +107,34 @@ def render_markdown(rep: dict) -> str:
             f"| {name} | {_f(a['mean_pnl'], True)} | {_f(a['hit_rate'])} | {a['n_long']} | "
             f"{a['n_short']} | {a['n_abstain']} | {a['n_unparseable']} |"
         )
-    b = rep["bootstrap"]
     lines += [
         "",
-        f"Bootstrap: {b['method']}, {b['n_resamples']} resamples, seed {b['seed']}. "
-        "Dates are resampled as clusters because episodes on one date share the market move.",
-        "Unparseable answers count as ABSTAIN (pnl 0).",
+        f"Interval: {rep['interval']['method']}. Each decision date is one observation because "
+        "episodes on one date share the market move.",
+        f"Unparseable answers count as ABSTAIN (pnl 0); above {rep['interval']['max_unparseable_rate']:.0%} "
+        "in either arm the run is invalid.",
     ]
+    b = rep.get("robustness", {}).get("cluster_bootstrap")
+    if b:
+        lines += [
+            "",
+            f"## Robustness: {b['method']}",
+            "",
+            f"{b['n_resamples']} resamples, seed {b['seed']}. Known to under-cover at 30-60 dates.",
+            "",
+            "| Part | Bootstrap CI |",
+            "|---|---|",
+        ]
+        for label, key in (
+            ("All", "gap"),
+            ("Before cutoff", "pre"),
+            ("On/after cutoff", "post"),
+            ("Pre minus post", "diff_pre_minus_post"),
+        ):
+            c = b[key]
+            cell = "n/a" if not c else f"[{_f(c['low'], True)}, {_f(c['high'], True)}]"
+            lines.append(f"| {label} | {cell} |")
+    lines += ["", "## Limits of this probe", ""] + [f"- {x}" for x in LIMITS]
     if "usage" in rep:
         u = rep["usage"]
         lines += [

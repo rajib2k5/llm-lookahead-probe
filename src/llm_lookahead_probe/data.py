@@ -30,6 +30,16 @@ DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_MAX_ROWS = 2_000_000
 DEFAULT_MAX_TICKERS = 1_000
 MAX_LINE_CHARS = 200
+# A close is plain decimal text: digits, optionally a dot and more digits. `float()` alone also
+# accepts "1_000", " 5 ", "+6", "1e3", "nan" and "inf"; none of those is a price a data vendor
+# writes, so they are rejected rather than silently reinterpreted.
+CLOSE_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+# Upper bound on a close. Masking multiplies prices by at most 6, so every masked price stays a
+# small, finite number that renders as plain d.dd text (no exponent, no inf).
+MAX_CLOSE = 1e7
+# Earliest allowed date. Masking shifts dates back by the panel span plus up to ~2 years; an early
+# date (e.g. year 0001) would underflow `datetime.date` and crash the run.
+MIN_YEAR = 1900
 
 
 class PriceDataError(ValueError):
@@ -136,8 +146,9 @@ def load_prices_csv(
 ) -> PricePanel:
     """Load and strictly validate a `date,ticker,close` CSV.
 
-    Rules: exact header; ISO dates; ticker matches TICKER_RE and is not a reserved word; close is a
-    finite positive number; rows strictly increasing in (date, ticker), which also forbids
+    Rules: exact header; ISO dates on or after MIN_YEAR-01-01; ticker matches TICKER_RE and is not
+    a reserved word; close matches CLOSE_RE (plain decimal), is positive and at most MAX_CLOSE;
+    rows strictly increasing in (date, ticker), which also forbids
     duplicates; every ticker present on every date (rectangular); size limits on bytes, rows,
     tickers and line length. Raises PriceDataError naming the first failing line.
     """
@@ -175,18 +186,25 @@ def load_prices_csv(
                 d = date.fromisoformat(ds)
             except ValueError:
                 raise PriceDataError(f"line {lineno}: invalid date {ds!r}") from None
+            if d.year < MIN_YEAR:
+                raise PriceDataError(f"line {lineno}: date {ds} is before {MIN_YEAR}-01-01")
             if not TICKER_RE.fullmatch(ticker):
                 raise PriceDataError(f"line {lineno}: ticker must match {TICKER_RE.pattern}")
             if ticker in RESERVED_WORDS:
                 raise PriceDataError(f"line {lineno}: ticker {ticker!r} is a reserved word")
-            try:
-                close = float(cs)
-            except ValueError:
-                raise PriceDataError(f"line {lineno}: close is not a number") from None
-            if not math.isfinite(close):
+            if not CLOSE_RE.fullmatch(cs):
+                raise PriceDataError(
+                    f"line {lineno}: close is not a plain decimal number (digits with an optional "
+                    "fraction, e.g. 12.34; no sign, spaces, exponent, underscores, nan or inf); "
+                    "it must be finite and positive"
+                )
+            close = float(cs)
+            if not math.isfinite(close):  # unreachable for CLOSE_RE text of <= 200 chars; kept
                 raise PriceDataError(f"line {lineno}: close must be finite")
             if close <= 0:
                 raise PriceDataError(f"line {lineno}: close must be positive")
+            if close > MAX_CLOSE:
+                raise PriceDataError(f"line {lineno}: close {cs} exceeds the maximum {MAX_CLOSE:.0f}")
             key = (d, ticker)
             if prev is not None and key <= prev:
                 raise PriceDataError(

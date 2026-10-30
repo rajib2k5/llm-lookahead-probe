@@ -5,11 +5,13 @@ import pytest
 
 from llm_lookahead_probe.prompt import Action
 from llm_lookahead_probe.stats import (
+    MAX_UNPARSEABLE_RATE,
     MIN_DATES_PER_PART,
     EpisodeResult,
     bootstrap_ratio_draws,
     cluster_bootstrap_ci,
     summarise,
+    t_quantile,
 )
 
 D0 = date(2024, 1, 1)
@@ -121,3 +123,147 @@ def test_summarise_resamples_by_date_not_by_episode():
     iid = cluster_bootstrap_ci(diffs, np.arange(len(diffs)), 2000, 0.95, seed=0)
     width = s["gap"]["high"] - s["gap"]["low"]
     assert width > 2.5 * (iid.high - iid.low)
+
+
+def _with_unparseable(recs, arm, every):
+    """Mark every `every`-th record's answer in `arm` as unparseable (ABSTAIN), like a refusal."""
+    out = []
+    for k, e in enumerate(recs):
+        if k % every == 0:
+            if arm in ("unmasked", "both"):
+                e = EpisodeResult(e.ticker, e.date, e.r, Action.ABSTAIN, False, e.action_m, e.parsed_m)
+            if arm in ("masked", "both"):
+                e = EpisodeResult(e.ticker, e.date, e.r, e.action_u, e.parsed_u, Action.ABSTAIN, False)
+        out.append(e)
+    return out
+
+
+def test_all_answers_unparseable_is_an_invalid_run_not_no_evidence():
+    recs = _with_unparseable(make_records(40, 40, 0.0, 0.0), "both", every=1)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+    assert "unparseable" in s["verdict_reason"]
+
+
+def test_masked_arm_mostly_unparseable_is_an_invalid_run():
+    # Masked answers fail for half the episodes: the gap measures refusals, not memory.
+    recs = _with_unparseable(make_records(40, 40, 0.01, 0.0), "masked", every=2)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+
+
+def test_unparseable_rate_at_the_threshold_is_still_a_valid_run():
+    # 1 in 10 = exactly MAX_UNPARSEABLE_RATE in every part: allowed (the rule is "exceeds").
+    assert MAX_UNPARSEABLE_RATE == 0.10
+    recs = _with_unparseable(make_records(40, 40, 0.0, 0.0), "both", every=10)
+    s = summarise(recs, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "no evidence"
+
+
+def test_unparseable_only_in_one_part_is_an_invalid_run():
+    pre = _with_unparseable(make_records(40, 0, 0.0, 0.0), "masked", every=4)  # 25% of pre
+    post = [e for e in make_records(40, 40, 0.0, 0.0) if e.date >= CUT]
+    s = summarise(pre + post, CUT, 2000, 0.95, seed=0)
+    assert s["verdict"] == "invalid run"
+    assert str(MAX_UNPARSEABLE_RATE) in s["verdict_rule"] or "10%" in s["verdict_rule"]
+
+
+@pytest.mark.parametrize(
+    "q, df, table",
+    [
+        (0.975, 29, 2.0452),
+        (0.975, 59, 2.0010),
+        (0.975, 10, 2.2281),
+        (0.975, 1, 12.7062),
+        (0.995, 5, 4.0321),
+        (0.95, 20, 1.7247),
+        (0.025, 10, -2.2281),
+    ],
+)
+def test_t_quantile_matches_printed_tables(q, df, table):
+    assert t_quantile(q, df) == pytest.approx(table, abs=1e-4)
+
+
+def test_t_quantile_accepts_fractional_df_and_lies_between_neighbours():
+    assert t_quantile(0.975, 5) > t_quantile(0.975, 5.5) > t_quantile(0.975, 6)
+
+
+def _episodes(date_returns, start):
+    """Two tickers per date; unmasked LONG earns r, masked ABSTAIN earns 0, so the paired
+    difference of each episode is r and each date's mean difference is the mean of its two r."""
+    out = []
+    for k, (ra, rb) in enumerate(date_returns):
+        d = start + timedelta(days=k)
+        out.append(EpisodeResult("A", d, ra, Action.LONG, True, Action.ABSTAIN, True))
+        out.append(EpisodeResult("B", d, rb, Action.LONG, True, Action.ABSTAIN, True))
+    return out
+
+
+def test_gap_ci_is_a_t_interval_on_date_means_with_g_minus_1_df():
+    # Date means 0.01, 0.02, 0.03: mean 0.02, sd 0.01, G = 3, t(0.975, 2) = 4.302653.
+    recs = _episodes([(0.009, 0.011), (0.019, 0.021), (0.029, 0.031)], D0)
+    s = summarise(recs, D0 + timedelta(days=1000), 2000, 0.95, seed=0)
+    half = 4.302653 * 0.01 / 3**0.5
+    assert s["gap"]["estimate"] == pytest.approx(0.02)
+    assert s["gap"]["low"] == pytest.approx(0.02 - half, abs=1e-7)
+    assert s["gap"]["high"] == pytest.approx(0.02 + half, abs=1e-7)
+    assert s["gap"]["df"] == 2
+
+
+def test_pre_minus_post_ci_is_welch_with_satterthwaite_df():
+    pre = _episodes([(0.01, 0.01), (0.02, 0.02), (0.03, 0.03)], D0)  # var 1e-4, G 3
+    post_start = D0 + timedelta(days=10)
+    post = _episodes([(0.0, 0.0), (0.0, 0.0), (0.02, 0.02), (0.02, 0.02)], post_start)  # var 4e-4/3
+    s = summarise(pre + post, post_start, 2000, 0.95, seed=0)
+    d = s["diff_pre_minus_post"]
+    se = (1e-4 / 3 + (4e-4 / 3) / 4) ** 0.5
+    df = (1e-4 / 3 + (4e-4 / 3) / 4) ** 2 / ((1e-4 / 3) ** 2 / 2 + ((4e-4 / 3) / 4) ** 2 / 3)
+    assert df == pytest.approx(4.8)
+    assert d["estimate"] == pytest.approx(0.01)
+    assert d["df"] == pytest.approx(4.8)
+    assert d["low"] == pytest.approx(0.01 - t_quantile(0.975, 4.8) * se, abs=1e-9)
+    assert d["high"] == pytest.approx(0.01 + t_quantile(0.975, 4.8) * se, abs=1e-9)
+
+
+def test_unequal_episode_counts_per_date_are_refused():
+    # Date means equal the episode mean only when every date has the same number of episodes.
+    recs = _episodes([(0.01, 0.01), (0.02, 0.02)], D0)[:-1]
+    with pytest.raises(ValueError, match="same number of episodes"):
+        summarise(recs, D0 + timedelta(days=100), 2000, 0.95, seed=0)
+
+
+def test_cluster_bootstrap_is_kept_as_a_secondary_number():
+    s = summarise(make_records(40, 40, 0.01, 0.0), CUT, 2000, 0.95, seed=0)
+    rb = s["robustness"]["cluster_bootstrap"]
+    assert set(rb) >= {"gap", "pre", "post", "diff_pre_minus_post", "n_resamples"}
+    assert rb["gap"]["low"] < s["gap"]["estimate"] < rb["gap"]["high"]
+    assert "t-interval" in s["interval"]["method"]
+
+
+def test_bootstrap_can_be_switched_off_for_speed():
+    s = summarise(make_records(30, 30, 0.0, 0.0), CUT, 0, 0.95, seed=0)
+    assert s["robustness"]["cluster_bootstrap"] is None
+    with pytest.raises(ValueError, match="2000"):
+        summarise(make_records(30, 30, 0.0, 0.0), CUT, 500, 0.95, seed=0)
+
+
+def test_each_part_reports_gap_scaled_by_its_mean_absolute_return():
+    # A behaviour-constant masking effect (e.g. abstaining more when masked) scales with |r|, so
+    # the gap is also reported per unit of mean |r| for each period.
+    pre = _episodes([(0.01, -0.03), (0.02, 0.02)], D0)  # diffs = r; mean 0.005, mean|r| 0.02
+    post = _episodes([(0.04, -0.04), (0.04, 0.04)], D0 + timedelta(days=10))  # mean 0.02, |r| 0.04
+    s = summarise(pre + post, D0 + timedelta(days=10), 0, 0.95, seed=0)
+    assert s["pre"]["mean_abs_r"] == pytest.approx(0.02)
+    assert s["pre"]["gap_per_mean_abs_r"] == pytest.approx(0.005 / 0.02)
+    assert s["post"]["mean_abs_r"] == pytest.approx(0.04)
+    assert s["post"]["gap_per_mean_abs_r"] == pytest.approx(0.02 / 0.04)
+
+
+def test_hit_rate_counts_a_trade_on_a_zero_return_as_a_miss():
+    recs = [
+        EpisodeResult("A", D0, 0.0, Action.LONG, True, Action.ABSTAIN, True),
+        EpisodeResult("A", D0 + timedelta(1), 0.01, Action.LONG, True, Action.ABSTAIN, True),
+    ]
+    s = summarise(recs, CUT, 0, 0.95, seed=0)
+    assert s["arms"]["unmasked"]["hit_rate"] == pytest.approx(1 / 2)
+    assert s["arms"]["masked"]["hit_rate"] is None  # no trades
