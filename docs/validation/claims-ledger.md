@@ -1,6 +1,6 @@
 # Claims ledger (pre-registered, frozen)
 
-- Target: `/home/rajib2k5/dev/llm-lookahead-probe`, branch `feat/v0.1-probe`, HEAD `664301b`
+- Target: `.` (repository root), branch `feat/v0.1-probe`, HEAD `664301b`
   (file hashes in `env-pin.txt`).
 - Tier 2 (ML/numerics, no oracle; AI-written code).
 - Frozen: 2026-10-30T04:00Z, before any documentation was read and before any probe was run.

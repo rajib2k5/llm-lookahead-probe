@@ -1,5 +1,7 @@
 # Evidence-gated validation report (v0.1, commit 664301b)
 
+> This report validates commit 664301b (99 tests). Later commits address its findings; see [DESIGN.md](../DESIGN.md) for the current behaviour.
+
 Protocol: `evidence-gated-validation`, Tier 2. Channel A read primary documentation,
 papers and the installed SDK source. Channel B ran the probes in `probes/`. The ledger
 (`claims-ledger.md`) was frozen before either channel ran. Channel A's summary arrived

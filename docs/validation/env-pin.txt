@@ -1,5 +1,5 @@
 # env pin, 2026-10-30T03:55:52Z
-repo: /home/rajib2k5/dev/llm-lookahead-probe branch feat/v0.1-probe HEAD 664301b3d48b8e89883b324dfeff7bab2f0426b6
+repo: . (repository root) branch feat/v0.1-probe HEAD 664301b3d48b8e89883b324dfeff7bab2f0426b6
 git status --short:
 ?? docs/validation/
 interpreter: .venv/bin/python
@@ -17,7 +17,7 @@ httpx2==2.16.0
 idna==3.20
 iniconfig==2.3.1
 jiter==0.18.0
--e file:///home/rajib2k5/dev/llm-lookahead-probe
+-e . (this repository, editable; absolute path removed)
 numpy==2.5.4
 opentelemetry-api==1.45.2
 packaging==26.3

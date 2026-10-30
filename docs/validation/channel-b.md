@@ -1,6 +1,6 @@
 # Channel B: runtime audit
 
-- Interpreter: `/home/rajib2k5/dev/llm-lookahead-probe/.venv/bin/python` (Python 3.12.13, numpy 2.5.4,
+- Interpreter: `.venv/bin/python` (Python 3.12.13, numpy 2.5.4,
   anthropic 2.3.0). See `env-pin.txt`.
 - Probes: `docs/validation/probes/`. Run from that directory. Falsifiers: `./run_mutant.sh <mutation> <probe>`
   (copies `src/` to a temp dir, applies one mutation from `mutations.py`, asserts the mutant module is the
