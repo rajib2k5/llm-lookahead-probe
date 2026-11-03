@@ -103,7 +103,8 @@ def markdown_capture(title_cmd: str, parts: list[str], width: int = WIDTH) -> Co
     console = Console(
         record=True, width=width, file=io.StringIO(), force_terminal=True, color_system="truecolor"
     )
-    console.print(Text("$ ", style="bold green") + Text(title_cmd, style="bold"))
+    # Not a shell command: the image is a rendered excerpt, so label it as one.
+    console.print(Text(title_cmd, style="dim italic"))
     for part in parts:
         console.print()
         console.print(Markdown(part))
@@ -190,7 +191,7 @@ def main() -> int:
     md = (DEMO / "reports" / "memorising" / "report.md").read_text()
     captures.append(md)
     secs = sections(md)
-    cmd = "cat reports/memorising/report.md"
+    cmd = "reports/memorising/report.md, rendered as Markdown (excerpt)"
     verdict = drop_lines(pick(secs, "Verdict"), ("Rule:",)).replace("\n\n\n", "\n\n")
     gap = pick(secs, "Gap")
     svgs["03-report-memorising"] = save_svg(
