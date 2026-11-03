@@ -11,7 +11,8 @@ version needs another build. If the browser is missing, run
 
 The script runs the real console script in offline mock mode (no API key, no `--live` spending)
 from the neutral directory /tmp/demo-llm-lookahead-probe, and captures its real stdout and
-stderr. It never types or fakes output. Each capture becomes a terminal-style SVG (rich) and then a PNG (headless Chromium).
+stderr. It never types or fakes output. Each capture becomes a terminal-style SVG (rich) and
+then a PNG (headless Chromium).
 The subprocess gets a clean environment, so no home path, PATH, or key can show in an image.
 Before it finishes, the script checks the SVG text for private strings and fails on a match.
 """
