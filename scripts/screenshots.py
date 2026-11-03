@@ -10,8 +10,9 @@ version needs another build. If the browser is missing, run
 `uv run --with playwright==1.62.0 playwright install chromium` once.
 
 The script runs the real console script in offline mock mode (no API key, no `--live` spending)
-from the neutral directory /tmp/demo, and captures its real stdout and stderr. It never types or
-fakes output. Each capture becomes a terminal-style SVG (rich) and then a PNG (headless Chromium).
+from the neutral directory /tmp/demo-llm-lookahead-probe, and captures its real stdout and
+stderr. It never types or fakes output. Each capture becomes a terminal-style SVG (rich) and
+then a PNG (headless Chromium).
 The subprocess gets a clean environment, so no home path, PATH, or key can show in an image.
 Before it finishes, the script checks the SVG text for private strings and fails on a match.
 """
@@ -30,7 +31,9 @@ from rich.markdown import Markdown
 from rich.text import Text
 
 ROOT = Path(__file__).resolve().parents[1]
-DEMO = Path("/tmp/demo")  # noqa: S108 - a fixed neutral directory is the point
+DEMO = Path("/tmp/demo-llm-lookahead-probe")  # noqa: S108 - a fixed neutral directory is the point
+# The script only ever deletes a DEMO it created itself, recognised by this marker file.
+MARKER = ".created-by-llm-lookahead-probe-screenshots"
 IMAGES = ROOT / "docs" / "images"
 SVG_DIR = DEMO / "svg"
 WIDTH = 100
@@ -50,7 +53,7 @@ def find_cli() -> str:
 
 
 def run_cli(cli: str, args: list[str]) -> str:
-    """Run the CLI in /tmp/demo with a clean environment and return stdout and stderr together."""
+    """Run the CLI in DEMO with a clean environment and return stdout and stderr together."""
     env = {"HOME": str(DEMO), "PATH": "/usr/bin:/bin", "NO_COLOR": "1", "LANG": "C.UTF-8"}
     proc = subprocess.run(  # noqa: S603
         [cli, *args], cwd=DEMO, env=env, capture_output=True, text=True, check=False, timeout=300
@@ -164,8 +167,11 @@ def write_prices_csv(path: Path) -> None:
 def main() -> int:
     cli = find_cli()
     if DEMO.exists():
+        if not (DEMO / MARKER).is_file():
+            sys.exit(f"{DEMO} exists but was not created by this script; move it away first")
         shutil.rmtree(DEMO)
     DEMO.mkdir(parents=True)
+    (DEMO / MARKER).touch()
 
     captures: list[str] = []
     svgs: dict[str, Path] = {}

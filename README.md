@@ -116,7 +116,7 @@ To regenerate the images, run this command from the repository root:
 uv run --with rich --with playwright==1.62.0 python scripts/screenshots.py
 ```
 
-The script runs the real commands in `/tmp/demo`, so the images always match the program output. It needs a Chromium build that matches Playwright 1.62.0. Run `uv run --with playwright==1.62.0 playwright install chromium` if the browser is missing.
+The script runs the real commands in `/tmp/demo-llm-lookahead-probe`, so the images always match the program output. It needs a Chromium build that matches Playwright 1.62.0. Run `uv run --with playwright==1.62.0 playwright install chromium` if the browser is missing.
 
 ## How it works
 
