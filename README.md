@@ -2,6 +2,10 @@
 
 A probe that measures how much the backtest of an LLM trading agent is inflated by memorised history.
 
+![Terminal output of the probe on the memorising mock model: the verdict is memorisation suspected, and the gap before the cutoff is +1.08% with a 95% interval that stays above zero.](docs/images/02-run-memorising.png)
+
+See [How to use](#how-to-use) for a walk-through with screenshots.
+
 ## What it does and why
 
 An LLM that trained on past market data can "predict" a move because it remembers the move. A backtest over that period then looks better than the agent will perform on new data. The probe runs each decision twice. The first prompt has the real ticker, the real dates, and the real prices. The second prompt is masked, so the model cannot look up the episode. The probe reports the gap between the two results as one number with a 95% confidence interval. It also compares the gap before the training cutoff of the model with the gap after it. Memory can create a gap before the cutoff. It cannot create a gap after the cutoff.
@@ -65,6 +69,54 @@ Both commands exit with code 0, because each run reached a verdict.
 Each run writes `report.json` and `report.md` to the `--out` directory. Other options: `--seed`, `--n-tickers`, `--n-dates`, `--window`, `--cutoff`, `--bootstrap`.
 
 The memorising mock recalls 75% of directions exactly. No real model is known to do this. The mock shows that the pipeline can detect a strong memoriser. It does not show how well the probe finds weak memory in a real model.
+
+## How to use
+
+These screenshots come from real runs in offline mock mode. They need no network and no API key.
+
+**1. See the commands and exit codes.** Install with `uv sync`, then ask for help.
+
+![Terminal output of llm-lookahead-probe --help, with the run subcommand and the exit codes 0 to 5.](docs/images/01-install.png)
+
+The help text lists the `run` command and what each exit code means.
+
+**2. Run the memorising mock.** This mock remembers the true next-day direction before its cutoff.
+
+![Terminal output of the run command with the memorising mock: the verdict is memorisation suspected, with the gap and its 95% intervals.](docs/images/02-run-memorising.png)
+
+The run prints the verdict, the gap, and the 95% intervals, then writes the reports.
+
+**3. Read the report.** The run writes `report.md` and `report.json` to the `--out` directory.
+
+![The report.md file: the verdict, and a table of the gap with its 95% interval for the whole run, before the cutoff, after the cutoff, and pre minus post.](docs/images/03-report-memorising.png)
+
+The report shows the verdict first, then the gap and its interval for each part of the run.
+
+**4. Compare before and after the cutoff.** Memory can create a gap before the cutoff, not after it.
+
+![Tables from report.md that compare the gap before and after the training cutoff, raw and drift-adjusted, with pre minus post.](docs/images/04-cutoff-split.png)
+
+Here the gap is large before the cutoff and near zero after it. The drift-adjusted column agrees.
+
+**5. Run the honest mock.** This mock uses only the price path.
+
+![Terminal output of the run command with the honest mock: the verdict is no evidence, and every interval includes zero.](docs/images/05-run-honest.png)
+
+The verdict is "no evidence", because the intervals include zero.
+
+**6. Check the cost of a live run (optional).** A live run uses your own price CSV. Without `--yes` it is a dry run.
+
+![Terminal output of a live dry run: the cost estimate, the planned decision dates, and the line that says no API calls were made.](docs/images/06-live-dry-run.png)
+
+The dry run prints the upper bound of the cost and makes no call. It needs no API key.
+
+To regenerate the images, run this command from the repository root:
+
+```bash
+uv run --with rich --with playwright==1.62.0 python scripts/screenshots.py
+```
+
+The script runs the real commands in `/tmp/demo`, so the images always match the program output. It needs a Chromium build that matches Playwright 1.62.0. Run `uv run --with playwright==1.62.0 playwright install chromium` if the browser is missing.
 
 ## How it works
 
